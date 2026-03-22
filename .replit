@@ -8,7 +8,7 @@ channel = "stable-25_05"
 [userenv]
 
 [userenv.shared]
-TELEGRAM_TOKEN = "8297752207:AAHjf-IQc9pSK6coh5BmqWKHR4XvOXZNiU8"
+TELEGRAM_TOKEN = "8795145097:AAHQjB25hUqsxGGg3rclmV2ir-vT9SYdQZY"
 TELEGRAM_CHAT_IDS = "-1002705155458"
 
 [workflows]
