@@ -1,0 +1,65 @@
+trading:
+  max_position_usd: 500.0
+  max_positions: 10
+  max_exposure_pct: 0.50
+  stop_loss_pct: 0.20
+  take_profit_pct: null
+  kelly_fraction: 0.25
+  scan_interval_sec: 60
+  signal_cooldown_sec: 3600
+  min_liquidity_usd: 10000.0
+  price_min: 0.05
+  price_max: 0.95
+  daily_loss_limit_usd: 200.0
+  trail_dist_pct: 0.02
+  trail_start_pct: 0.03
+  break_even_pct: 0.05
+  time_exit_minutes: 90.0
+
+edge_filter:
+  ev_threshold: 0.03
+  z_threshold: 1.5
+  spread_max: 0.05
+  liquidity_min: 10000.0
+  prob_min: 0.05
+  prob_max: 0.95
+
+execution:
+  order_timeout_sec: 60
+  max_retries: 2
+  queue_concurrency: 3
+  partial_fill_poll_sec: 2.0
+
+circuit_breaker:
+  failure_rate_window: 20
+  failure_rate_thresh: 0.50
+  consecutive_fail_max: 5
+  session_loss_max_usd: 200.0
+
+orderbook:
+  max_spread_pct: 0.04
+  min_volume_per_side: 50.0
+  min_fill_prob: 0.30
+
+notifications:
+  notify_signal: true
+  notify_open: true
+  notify_close: true
+  notify_filtered: false
+  notify_daily: true
+  notify_startstop: true
+  notify_circuit_break: true
+
+persistence:
+  state_file: "data/active_trades.json"
+  stale_trade_ttl_sec: 300
+
+polymarket:
+  clob_url: "https://clob.polymarket.com"
+  gamma_url: "https://gamma-api.polymarket.com"
+  market_limit: 300
+  polygon_rpc: "https://polygon.llamarpc.com"
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s %(levelname)-8s %(name)s | %(message)s"
