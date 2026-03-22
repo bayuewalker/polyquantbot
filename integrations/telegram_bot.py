@@ -51,6 +51,12 @@ class TelegramBot:
         self._task: Optional[asyncio.Task] = None
         self._bot  = None   # TradingBot reference, set via attach()
 
+        # ── Execution safety (Task 1) ─────────────────────────────────────
+        # Prevents /run spam from creating multiple execution loops.
+        self.is_running:     bool                    = False
+        self.current_task:   Optional[asyncio.Task]  = None
+        self.execution_lock: asyncio.Lock            = asyncio.Lock()
+
     def attach(self, trading_bot) -> None:
         self._bot = trading_bot
 
@@ -265,17 +271,49 @@ class TelegramBot:
                 f"Circuit breaker active.\nReason: {r}\nUse /reset first."
             )
             return
-        self._bot.running = True
+
+        async with self.execution_lock:          # ── Task 2: single-entry guard ──
+            if self.is_running:
+                await update.message.reply_text("Bot already running.")
+                return
+
+            self.is_running   = True
+            self._bot.running = True
+            # current_task tracks the loop guard (Task 4); the trading loop is
+            # embedded in the main scan cycle, so we store None here to signal
+            # that no separate coroutine was spawned from this command.
+            self.current_task = None
+
+        # Exactly ONE reply per valid start (Task 5)
         await update.message.reply_text("<b>Trading STARTED.</b>", parse_mode="HTML")
         await self.send("Bot started by operator.")
+        log.info("Execution guard: trading started by operator")
 
     async def _cmd_stop(self, update: "Update", context) -> None:
         if not self._auth(update):
             return
-        if self._bot:
-            self._bot.running = False
+
+        async with self.execution_lock:          # ── Task 3: single-entry guard ──
+            if not self.is_running:
+                await update.message.reply_text("Bot already stopped.")
+                return
+
+            self.is_running = False
+            if self._bot:
+                self._bot.running = False
+
+            if self.current_task and not self.current_task.done():
+                self.current_task.cancel()
+                try:
+                    await self.current_task
+                except asyncio.CancelledError:
+                    pass
+
+            self.current_task = None
+
         await update.message.reply_text("<b>Trading STOPPED.</b>", parse_mode="HTML")
         await self.send("Bot stopped by operator.")
+        log.info("Execution guard: trading stopped by operator")
 
     async def _cmd_status(self, update: "Update", context) -> None:
         if not self._auth(update):
