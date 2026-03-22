@@ -69,7 +69,13 @@ class TelegramBot:
             log.info("Telegram: disabled (no token or library missing)")
             return
         try:
-            app = Application.builder().token(self._token).build()
+            # Build Application WITHOUT an Updater so PTB never manages polling
+            app = (
+                Application.builder()
+                .token(self._token)
+                .updater(None)
+                .build()
+            )
 
             for cmd, fn in [
                 ("start",  self._cmd_start),
@@ -88,20 +94,16 @@ class TelegramBot:
 
             self._app = app
 
-            # Initialize and clear old webhook/pending updates
+            # Initialize the Application (bot session, handler registry)
             await app.initialize()
-            try:
-                await app.bot.delete_webhook(drop_pending_updates=True)
-            except Exception as exc:
-                log.warning("Telegram: delete_webhook failed (non-fatal): %s", exc)
+            # Start the Application dispatcher (update_queue → handlers)
+            await app.start()
 
-            # Spawn polling in a background task.
-            # run_polling() handles initialize/start/stop internally — do NOT
-            # call app.start() before it or PTB v21 will raise RuntimeError.
+            # Spawn the polling loop as a background task
             self._task = asyncio.create_task(
                 self._polling_task(), name="telegram_polling"
             )
-            log.info("Telegram: polling task spawned (PTB v21 run_polling)")
+            log.info("Telegram: polling task spawned")
 
         except Exception as exc:
             log.error("Telegram: start failed (non-fatal): %s", exc)
@@ -110,38 +112,54 @@ class TelegramBot:
 
     async def _polling_task(self) -> None:
         """
-        Run polling using PTB v21 async-compatible pattern.
-        Uses app.start() + updater.start_polling() so it works inside an
-        already-running asyncio event loop (run_polling() would raise
-        'This event loop is already running').
-        Restarts automatically on transient errors.
+        Single-instance manual polling loop.
+
+        Uses bot.get_updates() directly — bypasses the PTB Updater entirely
+        so there is exactly ONE getUpdates connection at all times.
+
+        On startup:
+          - Calls getUpdates(offset=-1, timeout=0) to take over any stale
+            session left by a previous instance. This terminates the old
+            connection on Telegram's side before we enter the main loop.
+
+        Each update is put into app.update_queue, which the Application's
+        internal _update_fetcher_task dispatches to registered handlers.
         """
         if not self._app:
             return
+
+        bot = self._app.bot
+        offset = 0
+
+        # ── Take over any existing session ────────────────────────────────
+        # Calling getUpdates(offset=-1) terminates any stale long-poll held
+        # by a previous bot instance and fast-forwards the offset so we do
+        # not replay old updates.
+        try:
+            stale = await bot.get_updates(offset=-1, timeout=0)
+            if stale:
+                offset = stale[-1].update_id + 1
+            log.info("Telegram: polling started (single instance)")
+        except Exception as exc:
+            log.warning("Telegram: session takeover warning (non-fatal): %s", exc)
+            log.info("Telegram: polling started (single instance)")
+
+        # ── Main polling loop ─────────────────────────────────────────────
         while True:
             try:
-                await self._app.start()
-                await self._app.updater.start_polling(
-                    drop_pending_updates=True,
+                updates = await bot.get_updates(
+                    offset=offset,
+                    timeout=10,
                     allowed_updates=Update.ALL_TYPES,
                 )
-                log.info("Telegram: polling started successfully")
-                # Keep alive until cancelled
-                while True:
-                    await asyncio.sleep(3600)
+                for update in updates:
+                    offset = update.update_id + 1
+                    await self._app.update_queue.put(update)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                log.error("Telegram: polling error — restarting in 10s: %s", exc)
-                try:
-                    await self._app.updater.stop()
-                except Exception:
-                    pass
-                try:
-                    await self._app.stop()
-                except Exception:
-                    pass
-                await asyncio.sleep(10)
+                log.warning("Telegram: polling error (retrying in 5s): %s", exc)
+                await asyncio.sleep(5)
 
     async def stop(self) -> None:
         """Graceful shutdown — does not raise."""
