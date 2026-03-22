@@ -110,23 +110,37 @@ class TelegramBot:
 
     async def _polling_task(self) -> None:
         """
-        Run polling via Application.run_polling() — PTB v21 async pattern.
-        No updater references. Restarts automatically on transient errors.
+        Run polling using PTB v21 async-compatible pattern.
+        Uses app.start() + updater.start_polling() so it works inside an
+        already-running asyncio event loop (run_polling() would raise
+        'This event loop is already running').
+        Restarts automatically on transient errors.
         """
         if not self._app:
             return
         while True:
             try:
-                await self._app.run_polling(
+                await self._app.start()
+                await self._app.updater.start_polling(
                     drop_pending_updates=True,
                     allowed_updates=Update.ALL_TYPES,
-                    close_loop=False,
                 )
-                break   # clean stop requested
+                log.info("Telegram: polling started successfully")
+                # Keep alive until cancelled
+                while True:
+                    await asyncio.sleep(3600)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 log.error("Telegram: polling error — restarting in 10s: %s", exc)
+                try:
+                    await self._app.updater.stop()
+                except Exception:
+                    pass
+                try:
+                    await self._app.stop()
+                except Exception:
+                    pass
                 await asyncio.sleep(10)
 
     async def stop(self) -> None:

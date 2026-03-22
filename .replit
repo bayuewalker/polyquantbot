@@ -5,6 +5,12 @@ expertMode = true
 [nix]
 channel = "stable-25_05"
 
+[userenv]
+
+[userenv.shared]
+TELEGRAM_TOKEN = "8297752207:AAHjf-IQc9pSK6coh5BmqWKHR4XvOXZNiU8"
+TELEGRAM_CHAT_IDS = "-1002705155458"
+
 [workflows]
 runButton = "Project"
 
@@ -21,9 +27,9 @@ args = "Start application"
 name = "Start application"
 author = "agent"
 
+[workflows.workflow.metadata]
+outputType = "console"
+
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "python polybot_v7_1.py --paper"
-
-[workflows.workflow.metadata]
-outputType = "console"
