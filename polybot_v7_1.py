@@ -100,11 +100,23 @@ class SignalModel:
         "default":   0.50,
     }
     KEYWORD_SCORE: dict[str, float] = {
+        # Crypto
         "bitcoin": 0.38, "btc": 0.38, "ethereum": 0.40,
+        # Macro
         "federal reserve": 0.70, "rate cut": 0.68,
         "recession": 0.35, "inflation": 0.35,
-        "election": 0.72, "trump": 0.72,
-        "elon": 0.72, "ai": 0.72,
+        # Politics — high-signal proper nouns
+        "election": 0.72, "trump": 0.72, "elon": 0.72,
+        # Politics — structural terms covering nomination/primary markets
+        "president": 0.68, "nomination": 0.62,
+        "republican": 0.65, "democrat": 0.65,
+        "primary": 0.62, "senate": 0.60, "congress": 0.58,
+        # Sports — covers NBA MVP, World Cup, etc.
+        "mvp": 0.58, "nba": 0.50, "nfl": 0.48,
+        "world cup": 0.58, "fifa": 0.55,
+        "championship": 0.50, "finals": 0.50,
+        # Tech / AI
+        "ai": 0.72, "openai": 0.65, "tesla": 0.60,
     }
 
     def __init__(self, weights: Optional[dict] = None) -> None:
@@ -565,13 +577,13 @@ class TradingBot:
         log.info("Candidates: %d / %d pass pre-filter", len(candidates), len(markets_raw))
 
         processed = 0
-        for mkt in candidates[:10]:
+        for mkt in candidates[:60]:
             try:
                 await self._process_market(mkt)
             except Exception as exc:
                 log.error("_process_market error %s: %s", mkt.get("condition_id", "?")[:12], exc)
             processed += 1
-            if processed >= 5:
+            if processed >= 30:
                 break
 
     async def _process_market(self, mkt: dict) -> None:
