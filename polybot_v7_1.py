@@ -383,13 +383,20 @@ class TradingBot:
         self._last_daily    = datetime.now(timezone.utc).date()
         self._scan_count    = 0
         self._shutdown_flag = False
-        self._last_heartbeat: float = time.time()   # Task 1+6: watchdog timestamp
+        self._last_heartbeat: float = time.time()   # watchdog timestamp
+        self._last_tg_heartbeat: float = 0.0        # last time heartbeat was sent to Telegram
         # Copy-trade alert deduplication: {wallet:market_id -> sent_timestamp}
         # Prevents re-alerting the same wallet/market combo within 4 hours
         self._copy_trade_sent: dict[str, float] = {}
         self.max_trades_per_cycle: int = 3
         self._top_signals: list[dict] = []
         self._mi_cache: dict[str, dict] = {}
+
+        # ── Anti-spam / dedup controls ────────────────────────────────────
+        # Part 1: per-market execution lock — prevents concurrent duplicate fills
+        self._active_markets: set[str] = set()
+        # Part 2: signal hash cache with 5-min TTL
+        self._signal_cache: dict[str, float] = {}
 
         # ── Per-cycle scan stats (reset each cycle, used for heartbeat) ───────
         self._cycle_markets_scanned:   int = 0
@@ -463,23 +470,30 @@ class TradingBot:
                     await self._check_exits()
                     await self._daily_check()
 
-                    # Heartbeat after each full scan+exit cycle
-                    try:
-                        await self.telegram.send(format_heartbeat(
-                            running=self.running,
-                            cycle=self._scan_count,
-                            markets_scanned=self._cycle_markets_scanned,
-                            candidates_evaluated=self._cycle_candidates_eval,
-                            signals_passed=self._cycle_signals_passed,
-                            trades_executed=self._cycle_trades_executed,
-                            balance=self.portfolio.total_value,
-                            cash=self.portfolio.cash,
-                            active_trades=len(self.portfolio.positions),
-                            drawdown_pct=self.portfolio.max_drawdown() * 100,
-                            daily_pnl=self.portfolio.daily_pnl,
-                        ))
-                    except Exception:
-                        pass
+                    # Part 4: Heartbeat — send at most once every 60 seconds
+                    _hb_now = time.time()
+                    if _hb_now - self._last_tg_heartbeat >= 60:
+                        self._last_tg_heartbeat = _hb_now
+                        try:
+                            await self.telegram.send_keyed(
+                                "heartbeat",
+                                format_heartbeat(
+                                    running=self.running,
+                                    cycle=self._scan_count,
+                                    markets_scanned=self._cycle_markets_scanned,
+                                    candidates_evaluated=self._cycle_candidates_eval,
+                                    signals_passed=self._cycle_signals_passed,
+                                    trades_executed=self._cycle_trades_executed,
+                                    balance=self.portfolio.total_value,
+                                    cash=self.portfolio.cash,
+                                    active_trades=len(self.portfolio.positions),
+                                    drawdown_pct=self.portfolio.max_drawdown() * 100,
+                                    daily_pnl=self.portfolio.daily_pnl,
+                                ),
+                                cooldown=60.0,
+                            )
+                        except Exception:
+                            pass
 
                 # Watchdog timestamp — updated every cycle whether running or not
                 self._last_heartbeat = time.time()
@@ -945,6 +959,24 @@ class TradingBot:
             ef.z_score, size_usd, price, momentum_str,
         )
 
+        # ── Part 1: Per-market execution lock ─────────────────────────────
+        if cid in self._active_markets:
+            log.debug("Execution lock: %s already active — skipping", cid[:12])
+            return False
+        self._active_markets.add(cid)
+
+        # ── Part 2: Signal dedup cache (5-min TTL) ─────────────────────────
+        _now = time.time()
+        signal_key = f"{cid}:{round(adjusted_ev, 3)}:{round(adjusted_conf, 3)}"
+        if signal_key in self._signal_cache:
+            log.debug("Signal cache hit: %s — skipping duplicate", cid[:12])
+            self._active_markets.discard(cid)
+            return False
+        # Prune expired cache entries
+        self._signal_cache = {k: v for k, v in self._signal_cache.items()
+                              if _now - v < 300}
+        self._signal_cache[signal_key] = _now
+
         signal_meta = {
             "ev":           adjusted_ev,
             "z_score":      ef.z_score,
@@ -961,7 +993,11 @@ class TradingBot:
             )
         except Exception as exc:
             log.error("order_manager.execute error %s: %s", cid[:12], exc)
+            self._active_markets.discard(cid)
             return False
+
+        if not placed:
+            self._active_markets.discard(cid)
 
         return bool(placed)
 
@@ -1264,7 +1300,9 @@ class TradingBot:
                     continue
                 closed = self.position_manager.close_position(oid, pos.current_price, reason)
                 if closed:
-                    self.guard.set_position_closed(pos.market_id)
+                    _closed_market_id = pos.market_id
+                    self.guard.set_position_closed(_closed_market_id)
+                    self._active_markets.discard(_closed_market_id)
                     self._cb.record_loss(max(0.0, -closed.pnl))
                     try:
                         hold_min = round(
@@ -1273,18 +1311,22 @@ class TradingBot:
                     except Exception:
                         hold_min = 0
                     pnl_pct = (closed.pnl / max(closed.size_usd, 0.01)) * 100
-                    await self.telegram.send(format_trade_close(
-                        question=closed.question,
-                        side=closed.side,
-                        exit_price=closed.current_price,
-                        pnl=closed.pnl,
-                        pnl_pct=pnl_pct,
-                        reason=reason,
-                        hold_minutes=hold_min,
-                        balance=self.portfolio.total_value,
-                        cash=self.portfolio.cash,
-                        active_trades=len(self.portfolio.positions),
-                    ))
+                    await self.telegram.send_keyed(
+                        f"trade_close_{_closed_market_id}",
+                        format_trade_close(
+                            question=closed.question,
+                            side=closed.side,
+                            exit_price=closed.current_price,
+                            pnl=closed.pnl,
+                            pnl_pct=pnl_pct,
+                            reason=reason,
+                            hold_minutes=hold_min,
+                            balance=self.portfolio.total_value,
+                            cash=self.portfolio.cash,
+                            active_trades=len(self.portfolio.positions),
+                        ),
+                        cooldown=30.0,
+                    )
             except Exception as exc:
                 log.error("close_position error %s: %s", oid[:12], exc)
 

@@ -65,6 +65,12 @@ class TelegramBot:
         self.current_task:   Optional[asyncio.Task]  = None
         self.execution_lock: asyncio.Lock            = asyncio.Lock()
 
+        # ── Telegram rate-limiter (Part 3) ────────────────────────────────
+        # Per-key cooldown: prevents duplicate messages within cooldown window.
+        import time as _time
+        self._last_sent: dict[str, float] = {}
+        self._time = _time
+
     def attach(self, trading_bot) -> None:
         self._bot = trading_bot
         # Sync auto-start state so /run and /stop stay consistent
@@ -162,9 +168,12 @@ class TelegramBot:
             stale = await bot.get_updates(offset=-1, timeout=0)
             if stale:
                 offset = stale[-1].update_id + 1
+            # Brief settle: let Telegram drop the old TCP connection before main loop
+            await asyncio.sleep(2)
             log.info("Telegram: polling started (single instance)")
         except Exception as exc:
             log.warning("Telegram: session takeover warning (non-fatal): %s", exc)
+            await asyncio.sleep(2)
             log.info("Telegram: polling started (single instance)")
 
         # ── Main polling loop ─────────────────────────────────────────────
@@ -215,6 +224,16 @@ class TelegramBot:
                 )
             except Exception as exc:
                 log.warning("TG send to %s failed: %s", cid, exc)
+
+    async def send_keyed(self, key: str, text: str, cooldown: float = 10.0) -> None:
+        """Rate-limited send: drops the message if the same key was sent within cooldown seconds."""
+        now = self._time.time()
+        last = self._last_sent.get(key, 0.0)
+        if now - last < cooldown:
+            log.debug("TG rate-limit: dropped key=%s (%.1fs ago)", key, now - last)
+            return
+        self._last_sent[key] = now
+        await self.send(text)
 
     # ── Typed alert helpers ────────────────────────────────────────────────────
 

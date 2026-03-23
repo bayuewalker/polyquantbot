@@ -368,8 +368,8 @@ class OrderManager:
             except Exception as exc:
                 log.warning("Post-balance check failed trade_id=%s: %s", t_id, exc)
 
-        await self._alert_placed(t_id, order_id, side, question, size_usd, price, pos.stop_loss,
-                                  signal_meta)
+        await self._alert_placed(t_id, order_id, market_id, side, question, size_usd, price,
+                                  pos.stop_loss, signal_meta)
         return True
 
     # ── Partial fill monitor ───────────────────────────────────────────────────
@@ -555,7 +555,7 @@ class OrderManager:
                 log.warning("_alert send failed: %s", exc)
 
     async def _alert_placed(
-        self, t_id: str, order_id: str, side: str,
+        self, t_id: str, order_id: str, market_id: str, side: str,
         question: str, size: float, price: float, sl: float,
         signal_meta: Optional[dict] = None,
     ) -> None:
@@ -570,7 +570,11 @@ class OrderManager:
             cash=cash,
             active_trades=active_trades,
         )
-        await self._alert(msg)
+        if self.tg:
+            try:
+                await self.tg.send_keyed(f"trade_open_{market_id}", msg, cooldown=30.0)
+            except Exception as exc:
+                log.warning("_alert_placed send_keyed failed: %s", exc)
 
     async def _alert_partial(
         self, t_id: str, filled_usd: float, total_usd: float, question: str
