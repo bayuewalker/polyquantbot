@@ -17,8 +17,8 @@ trading:
   time_exit_minutes: 90.0
 
 edge_filter:
-  ev_threshold: 0.03
-  z_threshold: 1.5
+  ev_threshold: 0.02
+  z_threshold: 1.0
   spread_max: 0.05
   liquidity_min: 10000.0
   prob_min: 0.05

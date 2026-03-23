@@ -103,12 +103,12 @@ class SignalModel:
         "bitcoin": 0.38, "btc": 0.38, "ethereum": 0.40,
         "federal reserve": 0.70, "rate cut": 0.68,
         "recession": 0.35, "inflation": 0.35,
-        "election": 0.50, "trump": 0.55,
-        "elon": 0.60, "ai": 0.60,
+        "election": 0.72, "trump": 0.72,
+        "elon": 0.72, "ai": 0.72,
     }
 
     def __init__(self, weights: Optional[dict] = None) -> None:
-        self._w  = weights or {"prior": 0.25, "market": 0.50, "sentiment": 0.25}
+        self._w  = weights or {"prior": 0.35, "market": 0.20, "sentiment": 0.45}
         self._ph: dict[str, deque] = {}
 
     def update(
