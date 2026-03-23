@@ -1,0 +1,124 @@
+Apply Telegram command extensions (production-safe, minimal changes).
+
+GOAL:
+Add real trading visibility commands:
+- /trades → list active trades
+- /pnl → portfolio performance
+- /positions → detailed positions
+
+---
+
+1. UPDATE integrations/telegram_bot.py
+
+ADD NEW HANDLERS:
+
+---
+
+Add function:
+
+async def trades_command(update, context):
+    bot = context.bot_data.get("bot_instance")
+    trades = bot.position_manager.get_active_trades()
+
+    if not trades:
+        await update.message.reply_text("No active trades.")
+        return
+
+    msg = "ACTIVE TRADES:\n"
+    for t in trades:
+        msg += f"\n• {t['market']}"
+        msg += f"\n  size: ${t['size']:.2f}"
+        msg += f"\n  entry: {t['entry_price']:.3f}"
+        msg += f"\n  side: {t['side']}\n"
+
+    await update.message.reply_text(msg)
+
+
+---
+
+Add function:
+
+async def pnl_command(update, context):
+    bot = context.bot_data.get("bot_instance")
+    portfolio = bot.position_manager.portfolio
+
+    pnl = portfolio.total_value - portfolio.initial_cash
+    pnl_pct = (pnl / portfolio.initial_cash) * 100 if portfolio.initial_cash > 0 else 0
+
+    msg = (
+        f"PORTFOLIO:\n"
+        f"Cash: ${portfolio.cash:.2f}\n"
+        f"Value: ${portfolio.total_value:.2f}\n"
+        f"PnL: ${pnl:.2f} ({pnl_pct:.2f}%)"
+    )
+
+    await update.message.reply_text(msg)
+
+
+---
+
+Add function:
+
+async def positions_command(update, context):
+    bot = context.bot_data.get("bot_instance")
+    trades = bot.position_manager.get_active_trades()
+
+    if not trades:
+        await update.message.reply_text("No open positions.")
+        return
+
+    msg = "POSITIONS DETAIL:\n"
+    for t in trades:
+        msg += f"\n[{t['market']}]"
+        msg += f"\n side: {t['side']}"
+        msg += f"\n entry: {t['entry_price']:.3f}"
+        msg += f"\n size: ${t['size']:.2f}"
+        msg += f"\n EV: {t.get('ev', 0):.3f}"
+        msg += f"\n Z: {t.get('z', 0):.2f}\n"
+
+    await update.message.reply_text(msg)
+
+
+---
+
+2. REGISTER COMMANDS
+
+Find where handlers are registered, ADD:
+
+application.add_handler(CommandHandler("trades", trades_command))
+application.add_handler(CommandHandler("pnl", pnl_command))
+application.add_handler(CommandHandler("positions", positions_command))
+
+---
+
+3. PASS BOT INSTANCE (IMPORTANT)
+
+Ensure during setup:
+
+application.bot_data["bot_instance"] = bot
+
+If not present → ADD it.
+
+---
+
+RULES:
+- Do NOT modify existing commands
+- Do NOT change execution logic
+- Only add handlers + safe reads
+- No blocking operations
+
+---
+
+VERIFY:
+
+After restart:
+
+/trades → shows active trades
+/pnl → shows balance + pnl
+/positions → detailed entries
+
+---
+
+RETURN:
+- Confirmation handlers registered
+- Screenshot or logs of command output

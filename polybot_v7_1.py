@@ -177,7 +177,9 @@ class OrderbookEvaluator:
             "adjusted_price": 0.0,
         }
         if not ob:
-            return _empty
+            # CLOB unavailable (AMM-only market or no active orders) — treat as no_ob_fallback
+            return {**_empty, "allow": True, "reason": "no_ob_fallback",
+                    "liquidity_score": 0.15, "fill_prob": 0.50}
 
         def parse(raw: list) -> list[dict]:
             out = []
@@ -525,7 +527,7 @@ class TradingBot:
 
         for m in markets_raw:
             try:
-                tokens = m.get("tokens", [])
+                tokens    = m.get("tokens", [])
                 yt = next((t for t in tokens if t.get("outcome", "").upper() == "YES"), {})
                 nt = next((t for t in tokens if t.get("outcome", "").upper() == "NO"),  {})
                 cid    = m.get("conditionId", "")
@@ -538,6 +540,11 @@ class TradingBot:
                 if liq < self._min_liq:                          continue
                 if not (self._price_min <= yes_px <= self._price_max): continue
 
+                # Bug fix: group markets store token IDs in clobTokenIds, not tokens[].tokenId
+                clob_ids = m.get("clobTokenIds") or []
+                tok_yes  = yt.get("tokenId", "") or (clob_ids[0] if len(clob_ids) > 0 else "")
+                tok_no   = nt.get("tokenId", "") or (clob_ids[1] if len(clob_ids) > 1 else "")
+
                 seen.add(cid)
                 candidates.append({
                     "condition_id": cid,
@@ -545,15 +552,16 @@ class TradingBot:
                     "yes_price":    yes_px,
                     "no_price":     float(nt.get("price", 0.5)),
                     "liquidity":    liq,
-                    "volume_24h":   float(m.get("volume24hr", 0)),
+                    "volume_24h":   float(m.get("volume24hr", 0) or 0),
                     "category":     m.get("category", "default"),
-                    "token_id_yes": yt.get("tokenId", ""),
-                    "token_id_no":  nt.get("tokenId", ""),
+                    "token_id_yes": tok_yes,
+                    "token_id_no":  tok_no,
                 })
             except Exception:
                 continue
 
-        candidates.sort(key=lambda x: x["liquidity"], reverse=True)
+        # Sort by 24h volume — prioritises markets with active orderbooks
+        candidates.sort(key=lambda x: x["volume_24h"], reverse=True)
         log.info("Candidates: %d / %d pass pre-filter", len(candidates), len(markets_raw))
 
         processed = 0
