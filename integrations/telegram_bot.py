@@ -17,6 +17,13 @@ import html
 import logging
 from typing import TYPE_CHECKING, Optional
 
+from integrations.telegram_formatter import (
+    format_startup_report,
+    format_status,
+    format_alpha,
+    format_circuit_breaker,
+)
+
 log = logging.getLogger("polybot.telegram")
 
 try:
@@ -246,11 +253,31 @@ class TelegramBot:
         )
 
     async def alert_circuit_breaker(self, reason: str) -> None:
-        await self.send(
-            f"<b>CIRCUIT BREAKER TRIPPED</b>\n"
-            f"Reason: {reason}\n"
-            f"All trading halted. Send /reset to clear."
-        )
+        await self.send(format_circuit_breaker(reason))
+
+    async def send_startup_report(
+        self,
+        mode: str,
+        balance: float,
+        cash: float,
+        position_count: int,
+        max_positions: int,
+        market_count: int,
+        scan_interval: int,
+        intelligence_status: str,
+        autostart: bool,
+    ) -> None:
+        await self.send(format_startup_report(
+            mode=mode,
+            balance=balance,
+            cash=cash,
+            position_count=position_count,
+            max_positions=max_positions,
+            market_count=market_count,
+            scan_interval=scan_interval,
+            intelligence_status=intelligence_status,
+            autostart=autostart,
+        ))
 
     async def alert_trade_opened(
         self,
@@ -403,32 +430,37 @@ class TelegramBot:
         b  = self._bot
         p  = b.portfolio
         cb = b.guard.circuit_breaker
-        ef = b.edge_filter
 
-        halt_txt = ("YES \u2014 " + (b.guard._halt_reason or cb.trip_reason)) \
-                    if b.guard.is_halted else "NO"
-        pos_lines = [
-            f"  {pos.side} {pos.question[:26]} ${pos.size_usd:.0f} {pos.pnl:+.2f}"
-            for pos in list(p.positions.values())[:5]
-        ] or ["  (none)"]
+        halt_reason = b.guard._halt_reason or (cb.trip_reason if cb else "") or ""
+        unrealized  = sum(pos.pnl for pos in p.positions.values())
+        drawdown    = p.max_drawdown() * 100
+
+        positions_data = [
+            {
+                "side":          pos.side,
+                "question":      pos.question,
+                "entry_price":   pos.entry_price,
+                "current_price": pos.current_price,
+                "pnl":           pos.pnl,
+            }
+            for pos in list(p.positions.values())[:10]
+        ]
 
         try:
             await update.message.reply_text(
-                f"<b>PolyBot Status</b>\n"
-                f"Running: <b>{'YES' if b.running else 'NO'}</b>\n"
-                f"Halted:  <b>{halt_txt}</b>\n\n"
-                f"<b>Portfolio</b>\n"
-                f"  Cash:      ${p.cash:.2f}\n"
-                f"  Total:     ${p.total_value:.2f}\n"
-                f"  Daily P&L: {p.daily_pnl:+.2f}\n"
-                f"  Positions: {len(p.positions)}\n"
-                f"  Win rate:  {p.win_rate()*100:.1f}%\n\n"
-                f"<b>Positions</b>\n" + "\n".join(pos_lines) + "\n\n"
-                f"<b>Circuit Breaker</b>\n"
-                f"  Tripped: {cb.is_tripped}  "
-                f"Consec: {cb._consecutive_failures}  "
-                f"Loss: ${cb._session_loss:.2f}\n\n"
-                f"<b>Edge Filter</b>\n  {ef.stats_summary()}",
+                format_status(
+                    running=b.running,
+                    is_halted=b.guard.is_halted,
+                    halt_reason=halt_reason,
+                    balance=p.total_value,
+                    cash=p.cash,
+                    unrealized_pnl=unrealized,
+                    daily_pnl=p.daily_pnl,
+                    drawdown_pct=drawdown,
+                    positions=positions_data,
+                    cycle_limit=getattr(b, "max_trades_per_cycle", 3),
+                    scan_interval=getattr(b, "_scan_interval", 60),
+                ),
                 parse_mode="HTML",
             )
         except Exception as exc:
@@ -740,24 +772,11 @@ class TelegramBot:
         if not self._bot:
             await update.message.reply_text("Bot not initialised."); return
         signals = getattr(self._bot, "_top_signals", [])
-        if not signals:
-            await update.message.reply_text(
-                "No signals yet — waiting for next scan cycle."
-            )
-            return
-        lines = ["<b>TOP ALPHA SIGNALS</b>\n"]
-        for i, s in enumerate(signals[:5], 1):
-            boost_txt = ""
-            if s.get("social", 0) != 0 or s.get("liq", 0) != 0:
-                boost_txt = f"  Social: {s['social']:+.3f}  Liq: {s['liq']:+.3f}\n"
-            lines.append(
-                f"{i}. {html.escape(s['title'][:50])}\n"
-                f"EV: {s['ev']:.3f}  Z: {s['z']:.2f}  Prob: {s['prob']:.2f}\n"
-                f"Size: ${s['size']:.2f} @ {s['price']:.4f}\n"
-                f"{boost_txt}"
-            )
         try:
-            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+            await update.message.reply_text(
+                format_alpha(signals),
+                parse_mode="HTML",
+            )
         except Exception as exc:
             log.warning("_cmd_alpha send error: %s", exc)
 

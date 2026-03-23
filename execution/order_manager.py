@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Optional
 
 from core.execution_guard import ExecutionGuard, TradeState
 from core.position_manager import PositionManager, Portfolio
+from integrations.telegram_formatter import format_trade_open, format_circuit_breaker
 
 if TYPE_CHECKING:
     from integrations.polymarket_client import PolymarketClient
@@ -57,19 +58,22 @@ class OrderManager:
 
     async def execute(
         self,
-        market_id: str,
-        question:  str,
-        token_id:  str,
-        side:      str,
-        size_usd:  float,
-        price:     float,
-        strategy:  str,
+        market_id:   str,
+        question:    str,
+        token_id:    str,
+        side:        str,
+        size_usd:    float,
+        price:       float,
+        strategy:    str,
+        signal_meta: Optional[dict] = None,
     ) -> bool:
         """
         Full 14-step execution pipeline.
         Triple safety guard at top: halt / position lock / duplicate.
         Returns True on fill (full or partial), False otherwise.
+        signal_meta: optional dict with ev, z_score, confidence, social_boost, liq_boost.
         """
+        _signal_meta = signal_meta
 
         # ── SAFETY TRIPLE-CHECK (no locks needed) ─────────────────────────────
 
@@ -183,7 +187,7 @@ class OrderManager:
                                 )
                                 success = await self._record_fill(
                                     t_id, oid, market_id, question, token_id,
-                                    side, size_usd, price, pre_balance,
+                                    side, size_usd, price, pre_balance, _signal_meta,
                                 )
                                 break
                         except Exception as exc:
@@ -261,7 +265,7 @@ class OrderManager:
                             # full fill
                             success = await self._record_fill(
                                 t_id, oid, market_id, question, token_id,
-                                side, size_usd, price, pre_balance,
+                                side, size_usd, price, pre_balance, _signal_meta,
                             )
                             break
 
@@ -322,6 +326,7 @@ class OrderManager:
         size_usd:    float,
         price:       float,
         pre_balance: float,
+        signal_meta: Optional[dict] = None,
     ) -> bool:
         try:
             self.guard._fsm_set(t_id, TradeState.FILLED)
@@ -363,7 +368,8 @@ class OrderManager:
             except Exception as exc:
                 log.warning("Post-balance check failed trade_id=%s: %s", t_id, exc)
 
-        await self._alert_placed(t_id, order_id, side, question, size_usd, price, pos.stop_loss)
+        await self._alert_placed(t_id, order_id, side, question, size_usd, price, pos.stop_loss,
+                                  signal_meta)
         return True
 
     # ── Partial fill monitor ───────────────────────────────────────────────────
@@ -550,15 +556,19 @@ class OrderManager:
 
     async def _alert_placed(
         self, t_id: str, order_id: str, side: str,
-        question: str, size: float, price: float, sl: float
+        question: str, size: float, price: float, sl: float,
+        signal_meta: Optional[dict] = None,
     ) -> None:
-        msg = (
-            f"<b>Trade Opened</b>\n"
-            f"trade_id: <code>{t_id}</code>\n"
-            f"orderID:  <code>{order_id}</code>\n"
-            f"Market: {question[:50]}\n"
-            f"Side: {side}  Size: ${size:.2f}  @ {price:.4f}\n"
-            f"SL: {sl:.4f}"
+        cash          = self.portfolio.cash
+        active_trades = len(self.portfolio.positions)
+        msg = format_trade_open(
+            question=question,
+            side=side,
+            price=price,
+            size_usd=size,
+            signal_meta=signal_meta,
+            cash=cash,
+            active_trades=active_trades,
         )
         await self._alert(msg)
 
@@ -592,9 +602,4 @@ class OrderManager:
         await self._alert(msg)
 
     async def _alert_circuit_breaker(self, reason: str) -> None:
-        msg = (
-            f"<b>CIRCUIT BREAKER TRIPPED</b>\n"
-            f"Reason: {reason}\n"
-            f"All trading halted."
-        )
-        await self._alert(msg)
+        await self._alert(format_circuit_breaker(reason))

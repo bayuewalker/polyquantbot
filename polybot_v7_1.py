@@ -51,6 +51,11 @@ from integrations.intelligence_client import (
 )
 from integrations.polymarket_client import PolymarketClient
 from integrations.telegram_bot      import TelegramBot
+from integrations.telegram_formatter import (
+    format_trade_close,
+    format_heartbeat,
+    format_error,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +391,16 @@ class TradingBot:
         self._top_signals: list[dict] = []
         self._mi_cache: dict[str, dict] = {}
 
+        # ── Per-cycle scan stats (reset each cycle, used for heartbeat) ───────
+        self._cycle_markets_scanned:   int = 0
+        self._cycle_candidates_eval:   int = 0
+        self._cycle_signals_passed:    int = 0
+        self._cycle_trades_executed:   int = 0
+
+    @property
+    def _last_alpha_signals(self) -> list:
+        return self._top_signals
+
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -418,18 +433,18 @@ class TradingBot:
 
         try:
             mode = "PAPER" if self.client.is_paper_trading() else "LIVE"
-            intel_status = "SAFE MODE" if self.intelligence.available else "OFFLINE"
-            await self.telegram.send(
-                f"<b>POLYBOT v7.1 STARTED</b>\n\n"
-                f"Mode: <b>{mode}</b>\n"
-                f"Balance: <b>${self.portfolio.total_value:.2f}</b>\n"
-                f"Markets Scanned: {self._market_limit}\n"
-                f"Strategy: Intelligence Hybrid\n\n"
-                f"<b>System:</b>\n"
-                f"Engine: ACTIVE\n"
-                f"Risk: ENABLED\n"
-                f"Intelligence: {intel_status}\n\n"
-                f"Auto-trading is {'ACTIVE' if self.running else 'STANDBY — send /run to start'}"
+            intel_status = "ONLINE" if self.intelligence.available else "OFFLINE"
+            t_cfg = self.cfg.get("trading", {})
+            await self.telegram.send_startup_report(
+                mode=mode,
+                balance=self.portfolio.total_value,
+                cash=self.portfolio.cash,
+                position_count=len(self.portfolio.positions),
+                max_positions=int(t_cfg.get("max_positions", 10)),
+                market_count=self._market_limit,
+                scan_interval=self._scan_interval,
+                intelligence_status=intel_status,
+                autostart=self.running,
             )
         except Exception:
             pass
@@ -438,11 +453,35 @@ class TradingBot:
         while not self._shutdown_flag:
             try:
                 if self.running:
+                    # Reset per-cycle scan stats
+                    self._cycle_markets_scanned  = 0
+                    self._cycle_candidates_eval  = 0
+                    self._cycle_signals_passed   = 0
+                    self._cycle_trades_executed  = 0
+
                     await self._scan()
                     await self._check_exits()
                     await self._daily_check()
 
-                # Task 1: Heartbeat — label updated, timestamp recorded for watchdog
+                    # Heartbeat after each full scan+exit cycle
+                    try:
+                        await self.telegram.send(format_heartbeat(
+                            running=self.running,
+                            cycle=self._scan_count,
+                            markets_scanned=self._cycle_markets_scanned,
+                            candidates_evaluated=self._cycle_candidates_eval,
+                            signals_passed=self._cycle_signals_passed,
+                            trades_executed=self._cycle_trades_executed,
+                            balance=self.portfolio.total_value,
+                            cash=self.portfolio.cash,
+                            active_trades=len(self.portfolio.positions),
+                            drawdown_pct=self.portfolio.max_drawdown() * 100,
+                            daily_pnl=self.portfolio.daily_pnl,
+                        ))
+                    except Exception:
+                        pass
+
+                # Watchdog timestamp — updated every cycle whether running or not
                 self._last_heartbeat = time.time()
                 log.info(
                     "BOT ALIVE | active_trades=%d | running=%s | cash=%.2f | balance=%.2f",
@@ -465,14 +504,14 @@ class TradingBot:
                 break
             except Exception as exc:
                 log.error("Main loop error: %s", exc, exc_info=True)
-                # Task 2 & 4: Alert on error — never crash silently
+                # Alert on error — never crash silently
                 try:
-                    await self.telegram.send(
-                        f"<b>CRITICAL ERROR</b>\n\n"
-                        f"Type: {type(exc).__name__}\n"
-                        f"Detail: {str(exc)[:200]}\n"
-                        f"Action: AUTO-RECOVERY"
-                    )
+                    await self.telegram.send(format_error(
+                        exc_type=type(exc).__name__,
+                        detail=str(exc),
+                        module="main_loop",
+                        action="AUTO-RECOVERY",
+                    ))
                 except Exception:
                     pass
                 await asyncio.sleep(5)
@@ -565,6 +604,10 @@ class TradingBot:
             self.portfolio.cash,
             self.guard.is_halted,
         )
+        self._cycle_markets_scanned = 0
+        self._cycle_candidates_eval = 0
+        self._cycle_signals_passed  = 0
+        self._cycle_trades_executed = 0
 
         if self.guard.is_halted:
             log.warning(
@@ -582,6 +625,7 @@ class TradingBot:
         if not markets_raw:
             log.warning("No markets returned from API")
             return
+        self._cycle_markets_scanned = len(markets_raw)
 
         # ── Market Insights enrichment (agent 575) ──────────────────────────
         # Pre-fetch market insights and cache by condition_id for signal boosts.
@@ -664,6 +708,7 @@ class TradingBot:
 
         trades_this_cycle = 0
         processed = 0
+        self._cycle_candidates_eval = len(candidates)
         for mkt in candidates[:60]:
             if trades_this_cycle >= self.max_trades_per_cycle:
                 log.info("Cycle trade cap reached (%d/%d) — stopping scan early",
@@ -673,6 +718,7 @@ class TradingBot:
                 placed = await self._process_market(mkt)
                 if placed:
                     trades_this_cycle += 1
+                    self._cycle_trades_executed += 1
             except Exception as exc:
                 log.error("_process_market error %s: %s", mkt.get("condition_id", "?")[:12], exc)
             processed += 1
@@ -886,6 +932,7 @@ class TradingBot:
         # Keep top 10 by EV
         self._top_signals.sort(key=lambda x: x["ev"], reverse=True)
         self._top_signals = self._top_signals[:10]
+        self._cycle_signals_passed += 1
 
         # Mark cooldown before execution (prevents re-entry while async executes)
         self._sent_cooldown[key] = time.time()
@@ -898,35 +945,25 @@ class TradingBot:
             ef.z_score, size_usd, price, momentum_str,
         )
 
+        signal_meta = {
+            "ev":           adjusted_ev,
+            "z_score":      ef.z_score,
+            "confidence":   adjusted_conf,
+            "social_boost": social_boost,
+            "liq_boost":    liquidity_boost,
+        }
+
         try:
             placed = await self.order_manager.execute(
                 market_id=cid, question=question, token_id=tok_id,
                 side="YES", size_usd=size_usd, price=price, strategy="Bayesian",
+                signal_meta=signal_meta,
             )
         except Exception as exc:
             log.error("order_manager.execute error %s: %s", cid[:12], exc)
             return False
 
-        if placed:
-            try:
-                await self.telegram.alert_trade_opened(
-                    question=question,
-                    side="YES",
-                    price=price,
-                    size_usd=size_usd,
-                    ev=adjusted_ev,
-                    z_score=ef.z_score,
-                    confidence=adjusted_conf,
-                    social_boost=social_boost,
-                    liq_boost=liquidity_boost,
-                    cash=self.portfolio.cash,
-                    active_trades=len(self.portfolio.positions),
-                )
-            except Exception as exc:
-                log.warning("alert_trade_opened failed (non-fatal): %s", exc)
-            return True
-
-        return False
+        return bool(placed)
 
     # ── Copy-trading pipeline ─────────────────────────────────────────────────
 
@@ -1236,7 +1273,7 @@ class TradingBot:
                     except Exception:
                         hold_min = 0
                     pnl_pct = (closed.pnl / max(closed.size_usd, 0.01)) * 100
-                    await self.telegram.alert_trade_closed(
+                    await self.telegram.send(format_trade_close(
                         question=closed.question,
                         side=closed.side,
                         exit_price=closed.current_price,
@@ -1245,7 +1282,9 @@ class TradingBot:
                         reason=reason,
                         hold_minutes=hold_min,
                         balance=self.portfolio.total_value,
-                    )
+                        cash=self.portfolio.cash,
+                        active_trades=len(self.portfolio.positions),
+                    ))
             except Exception as exc:
                 log.error("close_position error %s: %s", oid[:12], exc)
 
