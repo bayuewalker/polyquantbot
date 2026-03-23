@@ -88,16 +88,18 @@ class TelegramBot:
             )
 
             for cmd, fn in [
-                ("start",     self._cmd_start),
-                ("run",       self._cmd_run),
-                ("stop",      self._cmd_stop),
-                ("status",    self._cmd_status),
-                ("wallet",    self._cmd_wallet),
-                ("reset",     self._cmd_reset),
-                ("help",      self._cmd_start),
-                ("trades",    self._cmd_trades),
-                ("pnl",       self._cmd_pnl),
-                ("positions", self._cmd_positions),
+                ("start",        self._cmd_start),
+                ("run",          self._cmd_run),
+                ("stop",         self._cmd_stop),
+                ("status",       self._cmd_status),
+                ("wallet",       self._cmd_wallet),
+                ("reset",        self._cmd_reset),
+                ("help",         self._cmd_start),
+                ("trades",       self._cmd_trades),
+                ("pnl",          self._cmd_pnl),
+                ("positions",    self._cmd_positions),
+                ("leaderboard",  self._cmd_leaderboard),
+                ("traderpnl",    self._cmd_trader_pnl),
             ]:
                 app.add_handler(CommandHandler(cmd, fn))
 
@@ -258,14 +260,17 @@ class TelegramBot:
         mode   = "PAPER" if (self._bot and self._bot.client.is_paper_trading()) else "LIVE"
         await update.message.reply_text(
             f"<b>PolyBot v7.1</b>  |  Mode: <b>{mode}</b>\n\n"
-            "/run       \u2014 start trading\n"
-            "/stop      \u2014 pause trading\n"
-            "/status    \u2014 portfolio snapshot\n"
-            "/wallet    \u2014 balance\n"
-            "/reset     \u2014 reset circuit breaker\n"
-            "/trades    \u2014 open trades list\n"
-            "/pnl       \u2014 PnL summary\n"
-            "/positions \u2014 detailed positions",
+            "/run                         \u2014 start trading\n"
+            "/stop                        \u2014 pause trading\n"
+            "/status                      \u2014 portfolio snapshot\n"
+            "/wallet                      \u2014 balance\n"
+            "/reset                       \u2014 reset circuit breaker\n"
+            "/trades                      \u2014 open trades list\n"
+            "/pnl                         \u2014 local portfolio PnL\n"
+            "/pnl &lt;wallet&gt; [days]   \u2014 trader PnL + Wallet 360\n"
+            "/positions                   \u2014 detailed positions\n"
+            "/leaderboard [1d|7d|30d]     \u2014 top traders leaderboard\n"
+            "/traderpnl &lt;wallet&gt; [days] \u2014 trader PnL + profile",
             parse_mode="HTML",
             reply_markup=markup,
         )
@@ -408,10 +413,89 @@ class TelegramBot:
             log.warning("_cmd_trades send error: %s", exc)
 
     async def _cmd_pnl(self, update: "Update", context) -> None:
+        """
+        /pnl              — show local portfolio PnL summary
+        /pnl <wallet>     — show trader PnL via Intelligence API (agent 569 + 581)
+        /pnl <wallet> <days> — same, for last N days
+        """
         if not self._auth(update):
             return
         if not self._bot:
             await update.message.reply_text("Bot not initialised."); return
+
+        # If a wallet argument is provided, use the intelligence API (agents 569 + 581)
+        if context.args:
+            wallet = context.args[0].strip()
+            days   = 30
+            if len(context.args) >= 2:
+                try:
+                    days = int(context.args[1])
+                except ValueError:
+                    pass
+
+            intel = getattr(self._bot, "intelligence", None)
+            if intel is None or not intel.available:
+                await update.message.reply_text(
+                    "Intelligence API unavailable — INTELLIGENCE_API_KEY not configured.\n"
+                    "Use /pnl without arguments to see the local portfolio PnL."
+                )
+                return
+
+            try:
+                from integrations.intelligence_client import days_ago_date, today_date
+                pnl_rows, wallet_360 = await asyncio.gather(
+                    intel.get_pnl(
+                        wallet=wallet,
+                        granularity="1d",
+                        start_time=days_ago_date(days),
+                        end_time=today_date(),
+                    ),
+                    intel.get_wallet_360(proxy_wallet=wallet, window_days="7"),
+                    return_exceptions=True,
+                )
+            except Exception as exc:
+                await update.message.reply_text(f"Trader PnL fetch error: {exc}")
+                return
+
+            lines = [f"<b>Trader PnL</b> ({days}d)\n<code>{wallet[:20]}</code>\n"]
+
+            if isinstance(pnl_rows, list) and pnl_rows:
+                total_pnl = sum(
+                    float(row.get("pnl", 0) or row.get("realized_pnl", 0) or 0)
+                    for row in pnl_rows
+                )
+                lines.append(
+                    f"Realized PnL ({days}d): <b>${total_pnl:+.2f}</b>\n"
+                    f"Data points: {len(pnl_rows)}\n"
+                )
+            else:
+                lines.append("PnL data unavailable.\n")
+
+            if isinstance(wallet_360, list) and wallet_360:
+                w = wallet_360[0]
+                wr       = float(w.get("win_rate", 0) or 0)
+                roi      = float(w.get("roi", 0) or 0)
+                bot_sc   = float(w.get("bot_score", 0) or 0)
+                div      = w.get("market_diversity") or w.get("unique_markets") or "?"
+                h_score  = float(w.get("h_score", 0) or 0)
+                lines.append(
+                    f"<b>Wallet 360 (7d)</b>\n"
+                    f"  Win rate:  {wr*100:.1f}%\n"
+                    f"  ROI:       {roi*100:.1f}%\n"
+                    f"  H-Score:   {h_score:.1f}\n"
+                    f"  Bot score: {bot_sc:.2f}\n"
+                    f"  Diversity: {div} markets\n"
+                )
+            else:
+                lines.append("Wallet 360 data unavailable.\n")
+
+            try:
+                await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+            except Exception as exc:
+                log.warning("_cmd_pnl (wallet) send error: %s", exc)
+            return
+
+        # No wallet argument — show local portfolio PnL
         p = self._bot.portfolio
         try:
             await update.message.reply_text(
@@ -419,7 +503,8 @@ class TelegramBot:
                 f"Cash:          ${p.cash:.2f}\n"
                 f"Total Value:   ${p.total_value:.2f}\n"
                 f"Daily PnL:     {p.daily_pnl:+.2f}\n"
-                f"All-Time PnL:  {p.all_time_pnl:+.2f}",
+                f"All-Time PnL:  {p.all_time_pnl:+.2f}\n\n"
+                f"<i>Tip: /pnl &lt;wallet&gt; [days] to look up any trader</i>",
                 parse_mode="HTML",
             )
         except Exception as exc:
@@ -447,6 +532,133 @@ class TelegramBot:
             )
         except Exception as exc:
             log.warning("_cmd_positions send error: %s", exc)
+
+    async def _cmd_leaderboard(self, update: "Update", context) -> None:
+        if not self._auth(update):
+            return
+        if not self._bot:
+            await update.message.reply_text("Bot not initialised."); return
+
+        period = "7d"
+        if context.args:
+            raw = context.args[0].lower().strip()
+            if raw in ("1d", "7d", "30d"):
+                period = raw
+
+        intel = getattr(self._bot, "intelligence", None)
+        if intel is None or not intel.available:
+            await update.message.reply_text(
+                "Intelligence API unavailable — INTELLIGENCE_API_KEY not configured."
+            )
+            return
+
+        try:
+            entries = await intel.get_leaderboard(leaderboard_period=period, limit=10)
+        except Exception as exc:
+            await update.message.reply_text(f"Leaderboard fetch error: {exc}")
+            return
+
+        if not entries:
+            await update.message.reply_text(f"No leaderboard data for period={period}.")
+            return
+
+        lines = [f"<b>Top Traders ({period})</b>\n"]
+        for i, e in enumerate(entries[:10], 1):
+            wallet  = e.get("proxy_wallet") or e.get("wallet") or e.get("address") or "?"
+            pnl     = e.get("pnl") or e.get("profit") or 0
+            roi     = e.get("roi") or 0
+            wr      = e.get("win_rate") or 0
+            lines.append(
+                f"{i}. <code>{str(wallet)[:12]}</code>  "
+                f"PnL=${float(pnl):.0f}  ROI={float(roi)*100:.1f}%  "
+                f"WR={float(wr)*100:.1f}%"
+            )
+        try:
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        except Exception as exc:
+            log.warning("_cmd_leaderboard send error: %s", exc)
+
+    async def _cmd_trader_pnl(self, update: "Update", context) -> None:
+        if not self._auth(update):
+            return
+        if not self._bot:
+            await update.message.reply_text("Bot not initialised."); return
+
+        if not context.args:
+            await update.message.reply_text(
+                "Usage: /traderpnl &lt;wallet&gt; [days]\nExample: /traderpnl 0xabc123 30",
+                parse_mode="HTML",
+            )
+            return
+
+        wallet = context.args[0].strip()
+        days   = 30
+        if len(context.args) >= 2:
+            try:
+                days = int(context.args[1])
+            except ValueError:
+                pass
+
+        intel = getattr(self._bot, "intelligence", None)
+        if intel is None or not intel.available:
+            await update.message.reply_text(
+                "Intelligence API unavailable — INTELLIGENCE_API_KEY not configured."
+            )
+            return
+
+        try:
+            from integrations.intelligence_client import days_ago_date, today_date
+            pnl_rows, wallet_360_list = await asyncio.gather(
+                intel.get_pnl(
+                    wallet=wallet,
+                    granularity="1d",
+                    start_time=days_ago_date(days),
+                    end_time=today_date(),
+                ),
+                intel.get_wallet_360(proxy_wallet=wallet, window_days="7"),
+                return_exceptions=True,
+            )
+        except Exception as exc:
+            await update.message.reply_text(f"Trader PnL fetch error: {exc}")
+            return
+
+        lines = [f"<b>Trader Profile</b>\n<code>{wallet[:20]}</code>\n"]
+
+        if isinstance(pnl_rows, list) and pnl_rows:
+            total_pnl = sum(
+                float(row.get("pnl", 0) or row.get("realized_pnl", 0) or 0)
+                for row in pnl_rows
+            )
+            lines.append(
+                f"<b>PnL ({days}d)</b>\n"
+                f"  Realized: ${total_pnl:+.2f}\n"
+                f"  Points:   {len(pnl_rows)}\n"
+            )
+        else:
+            lines.append("PnL data unavailable.\n")
+
+        wallet_360 = wallet_360_list[0] if isinstance(wallet_360_list, list) and wallet_360_list else None
+        if wallet_360:
+            wr        = float(wallet_360.get("win_rate", 0) or 0)
+            bot_score = float(wallet_360.get("bot_score", 0) or 0)
+            diversity = wallet_360.get("market_diversity") or wallet_360.get("unique_markets") or "?"
+            h_score   = float(wallet_360.get("h_score", 0) or 0)
+            roi       = float(wallet_360.get("roi", 0) or 0)
+            lines.append(
+                f"<b>Wallet 360 (7d)</b>\n"
+                f"  Win rate:  {wr*100:.1f}%\n"
+                f"  ROI:       {roi*100:.1f}%\n"
+                f"  H-Score:   {h_score:.1f}\n"
+                f"  Bot score: {bot_score:.2f}\n"
+                f"  Diversity: {diversity} markets\n"
+            )
+        else:
+            lines.append("Wallet 360 data unavailable.\n")
+
+        try:
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        except Exception as exc:
+            log.warning("_cmd_trader_pnl send error: %s", exc)
 
     async def _cmd_reset(self, update: "Update", context) -> None:
         if not self._auth(update):

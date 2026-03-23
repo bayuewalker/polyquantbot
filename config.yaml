@@ -63,3 +63,36 @@ polymarket:
 logging:
   level: "INFO"
   format: "%(asctime)s %(levelname)-8s %(name)s | %(message)s"
+
+intelligence_api:
+  base_url: "https://narrative.agent.heisenberg.so"
+
+  # Feature toggles — set false to disable without code changes
+  market_insights_enabled: true
+  candlestick_enabled: true
+  orderbook_crosscheck_enabled: true
+  social_pulse_enabled: true
+  copy_trading_enabled: true
+
+  # Market discovery (agent 575)
+  market_insights_volume_trend: "UP"
+  market_insights_min_liquidity_percentile: "60"
+
+  # Candlestick momentum (agent 568)
+  candlestick_interval: "1h"
+  candlestick_limit: 24
+  candlestick_ema_period: 6
+
+  # Social Pulse thresholds (agent 585)
+  social_pulse_accel_boost: 1.5
+  social_pulse_accel_skip: 1.0
+  social_pulse_diversity_min: 40.0
+  social_pulse_ev_boost: 0.02
+  social_pulse_ev_penalty: 0.015
+
+  # Copy-trading pipeline (agents 584, 581, 556)
+  copy_trading_interval_min: 15
+  copy_trading_min_win_rate: 0.45
+  copy_trading_max_win_rate: 0.92
+  copy_trading_min_trades: 30
+  copy_trading_max_bot_score: 0.4
