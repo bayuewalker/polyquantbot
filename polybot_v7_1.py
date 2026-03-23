@@ -723,7 +723,13 @@ class TradingBot:
         trades_this_cycle = 0
         processed = 0
         self._cycle_candidates_eval = len(candidates)
+        max_pos = int(self.cfg.get("trading", {}).get("max_positions", 10))
         for mkt in candidates[:60]:
+            # Stop immediately if portfolio is already full — no point evaluating further
+            if len(self.portfolio.positions) >= max_pos:
+                log.info("Scan stopped: at max positions (%d/%d)",
+                         len(self.portfolio.positions), max_pos)
+                break
             if trades_this_cycle >= self.max_trades_per_cycle:
                 log.info("Cycle trade cap reached (%d/%d) — stopping scan early",
                          trades_this_cycle, self.max_trades_per_cycle)

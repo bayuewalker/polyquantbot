@@ -128,6 +128,15 @@ class TelegramBot:
             # Start the Application dispatcher (update_queue → handlers)
             await app.start()
 
+            # Clear any stale webhook — a webhook and getUpdates polling cannot
+            # coexist; this also terminates any old long-poll held by a previous
+            # instance more reliably than the offset=-1 trick alone.
+            try:
+                await app.bot.delete_webhook(drop_pending_updates=True)
+                log.info("Telegram: webhook cleared")
+            except Exception as _wh_exc:
+                log.debug("Telegram: webhook clear warning (non-fatal): %s", _wh_exc)
+
             # Spawn the polling loop as a background task
             self._task = asyncio.create_task(
                 self._polling_task(), name="telegram_polling"
@@ -168,12 +177,9 @@ class TelegramBot:
             stale = await bot.get_updates(offset=-1, timeout=0)
             if stale:
                 offset = stale[-1].update_id + 1
-            # Brief settle: let Telegram drop the old TCP connection before main loop
-            await asyncio.sleep(2)
             log.info("Telegram: polling started (single instance)")
         except Exception as exc:
-            log.warning("Telegram: session takeover warning (non-fatal): %s", exc)
-            await asyncio.sleep(2)
+            log.debug("Telegram: session offset sync warning (non-fatal): %s", exc)
             log.info("Telegram: polling started (single instance)")
 
         # ── Main polling loop ─────────────────────────────────────────────
@@ -190,8 +196,20 @@ class TelegramBot:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                log.warning("Telegram: polling error (retrying in 5s): %s", exc)
-                await asyncio.sleep(5)
+                err_str = str(exc)
+                if "Conflict" in err_str:
+                    # Another instance is polling — aggressively retake the session
+                    log.debug("Telegram: retaking session after conflict")
+                    try:
+                        stale = await bot.get_updates(offset=-1, timeout=0)
+                        if stale:
+                            offset = stale[-1].update_id + 1
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1)
+                else:
+                    log.warning("Telegram: polling error (retrying in 5s): %s", exc)
+                    await asyncio.sleep(5)
 
     async def stop(self) -> None:
         """Graceful shutdown — does not raise."""
