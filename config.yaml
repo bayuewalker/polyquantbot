@@ -68,11 +68,13 @@ intelligence_api:
   base_url: "https://narrative.agent.heisenberg.so"
 
   # Feature toggles — set false to disable without code changes
-  market_insights_enabled: true
-  candlestick_enabled: true
-  orderbook_crosscheck_enabled: true
-  social_pulse_enabled: true
-  copy_trading_enabled: true
+  # market_insights_enabled disabled: API returning 0 approved markets causes
+  # strict filter to reject all 300 candidates. Re-enable once API data validated.
+  market_insights_enabled: false
+  candlestick_enabled: false
+  orderbook_crosscheck_enabled: false
+  social_pulse_enabled: false
+  copy_trading_enabled: false
 
   # Market discovery (agent 575)
   market_insights_volume_trend: "UP"
