@@ -34,3 +34,7 @@ outputType = "console"
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "python polybot_v7_1.py --paper"
+
+[postMerge]
+path = "scripts/post-merge.sh"
+timeoutMs = 60000
