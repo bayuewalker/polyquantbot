@@ -60,6 +60,9 @@ class TelegramBot:
 
     def attach(self, trading_bot) -> None:
         self._bot = trading_bot
+        # Sync auto-start state so /run and /stop stay consistent
+        if trading_bot.running:
+            self.is_running = True
 
     # kept for backward compatibility with code that calls set_trading_bot()
     def set_trading_bot(self, trading_bot) -> None:

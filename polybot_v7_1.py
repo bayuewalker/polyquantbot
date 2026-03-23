@@ -261,7 +261,7 @@ class TradingBot:
     def __init__(self, cfg: dict, args: argparse.Namespace) -> None:
         self.cfg     = cfg
         self.args    = args
-        self.running = False
+        self.running = os.environ.get("AUTOSTART", "").lower() == "true"
 
         t_cfg = cfg.get("trading",         {})
         e_cfg = cfg.get("edge_filter",     {})
