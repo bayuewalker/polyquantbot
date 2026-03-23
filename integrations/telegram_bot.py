@@ -13,6 +13,7 @@ Changes vs previous version:
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 from typing import TYPE_CHECKING, Optional
 
@@ -84,13 +85,16 @@ class TelegramBot:
             )
 
             for cmd, fn in [
-                ("start",  self._cmd_start),
-                ("run",    self._cmd_run),
-                ("stop",   self._cmd_stop),
-                ("status", self._cmd_status),
-                ("wallet", self._cmd_wallet),
-                ("reset",  self._cmd_reset),
-                ("help",   self._cmd_start),
+                ("start",     self._cmd_start),
+                ("run",       self._cmd_run),
+                ("stop",      self._cmd_stop),
+                ("status",    self._cmd_status),
+                ("wallet",    self._cmd_wallet),
+                ("reset",     self._cmd_reset),
+                ("help",      self._cmd_start),
+                ("trades",    self._cmd_trades),
+                ("pnl",       self._cmd_pnl),
+                ("positions", self._cmd_positions),
             ]:
                 app.add_handler(CommandHandler(cmd, fn))
 
@@ -251,11 +255,14 @@ class TelegramBot:
         mode   = "PAPER" if (self._bot and self._bot.client.is_paper_trading()) else "LIVE"
         await update.message.reply_text(
             f"<b>PolyBot v7.1</b>  |  Mode: <b>{mode}</b>\n\n"
-            "/run    \u2014 start trading\n"
-            "/stop   \u2014 pause trading\n"
-            "/status \u2014 portfolio snapshot\n"
-            "/wallet \u2014 balance\n"
-            "/reset  \u2014 reset circuit breaker",
+            "/run       \u2014 start trading\n"
+            "/stop      \u2014 pause trading\n"
+            "/status    \u2014 portfolio snapshot\n"
+            "/wallet    \u2014 balance\n"
+            "/reset     \u2014 reset circuit breaker\n"
+            "/trades    \u2014 open trades list\n"
+            "/pnl       \u2014 PnL summary\n"
+            "/positions \u2014 detailed positions",
             parse_mode="HTML",
             reply_markup=markup,
         )
@@ -373,6 +380,70 @@ class TelegramBot:
             )
         except Exception as exc:
             await update.message.reply_text(f"Wallet fetch error: {exc}")
+
+    async def _cmd_trades(self, update: "Update", context) -> None:
+        if not self._auth(update):
+            return
+        if not self._bot:
+            await update.message.reply_text("Bot not initialised."); return
+        positions = list(self._bot.portfolio.positions.values())
+        if not positions:
+            await update.message.reply_text("No active trades.")
+            return
+        lines = []
+        for pos in positions:
+            lines.append(
+                f"<b>{pos.side}</b> {html.escape(pos.question[:40])}\n"
+                f"  Size: ${pos.size_usd:.2f}  Entry: {pos.entry_price:.4f}"
+            )
+        try:
+            await update.message.reply_text(
+                f"<b>Open Trades ({len(positions)})</b>\n\n" + "\n\n".join(lines),
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            log.warning("_cmd_trades send error: %s", exc)
+
+    async def _cmd_pnl(self, update: "Update", context) -> None:
+        if not self._auth(update):
+            return
+        if not self._bot:
+            await update.message.reply_text("Bot not initialised."); return
+        p = self._bot.portfolio
+        try:
+            await update.message.reply_text(
+                f"<b>PnL Summary</b>\n"
+                f"Cash:          ${p.cash:.2f}\n"
+                f"Total Value:   ${p.total_value:.2f}\n"
+                f"Daily PnL:     {p.daily_pnl:+.2f}\n"
+                f"All-Time PnL:  {p.all_time_pnl:+.2f}",
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            log.warning("_cmd_pnl send error: %s", exc)
+
+    async def _cmd_positions(self, update: "Update", context) -> None:
+        if not self._auth(update):
+            return
+        if not self._bot:
+            await update.message.reply_text("Bot not initialised."); return
+        positions = list(self._bot.portfolio.positions.values())
+        if not positions:
+            await update.message.reply_text("No active positions.")
+            return
+        lines = []
+        for pos in positions:
+            lines.append(
+                f"<b>{pos.side}</b> {html.escape(pos.question[:40])}\n"
+                f"  Entry: {pos.entry_price:.4f}  Size: ${pos.size_usd:.2f}  PnL: {pos.pnl:+.2f}"
+            )
+        try:
+            await update.message.reply_text(
+                f"<b>Positions ({len(positions)})</b>\n\n" + "\n\n".join(lines),
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            log.warning("_cmd_positions send error: %s", exc)
 
     async def _cmd_reset(self, update: "Update", context) -> None:
         if not self._auth(update):
