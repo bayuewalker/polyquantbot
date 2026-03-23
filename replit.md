@@ -54,3 +54,19 @@ All trading parameters are in `config.yaml`:
 
 ## Workflow
 - **Start application** — runs `python polybot_v7_1.py --paper` as a console process
+
+## rulesync (Skills Sync)
+rulesync is initialized to keep Replit agent skills in sync. Skills source files live in `.rulesync/skills/` and are generated to `.agents/skills/`.
+
+To sync skills after editing source files:
+```bash
+npx rulesync generate
+```
+
+To import skills from another AI coding tool (e.g., Claude Code):
+```bash
+npx rulesync import --targets claudecode --features skills
+npx rulesync generate
+```
+
+Config: `rulesync.jsonc` (targets: replit, features: skills)
