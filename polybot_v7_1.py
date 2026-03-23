@@ -337,6 +337,7 @@ class TradingBot:
         self._last_daily    = datetime.now(timezone.utc).date()
         self._scan_count    = 0
         self._shutdown_flag = False
+        self._last_heartbeat: float = time.time()   # Task 1+6: watchdog timestamp
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -361,6 +362,7 @@ class TradingBot:
         # Background tasks
         asyncio.create_task(self.order_manager.maintenance_loop(), name="order_maintenance")
         asyncio.create_task(self._balance_sync_loop(),              name="balance_sync")
+        asyncio.create_task(self._watchdog_loop(),                  name="loop_watchdog")
 
         try:
             await self.telegram.send(
@@ -380,19 +382,34 @@ class TradingBot:
                     await self._check_exits()
                     await self._daily_check()
 
-                # Health log every cycle
+                # Task 1: Heartbeat — label updated, timestamp recorded for watchdog
+                self._last_heartbeat = time.time()
                 log.info(
-                    "BOT ALIVE | running=%s | positions=%d | cash=%.2f | balance=%.2f",
-                    self.running,
+                    "BOT ALIVE | active_trades=%d | running=%s | cash=%.2f | balance=%.2f",
                     len(self.portfolio.positions),
+                    self.running,
                     self.portfolio.cash,
                     self.portfolio.total_value,
                 )
+
+                # Task 5: Memory safety — prune _sent_cooldown unconditionally
+                # (daily_check only runs when trading; this fires every cycle)
+                if len(self._sent_cooldown) > 1_000:
+                    _now = time.time()
+                    self._sent_cooldown = {
+                        k: v for k, v in self._sent_cooldown.items()
+                        if _now - v < self._cooldown_sec
+                    }
 
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 log.error("Main loop error: %s", exc, exc_info=True)
+                # Task 2 & 4: Alert on error — never crash silently
+                try:
+                    await self.telegram.send(f"CRITICAL ERROR: {exc}")
+                except Exception:
+                    pass
                 await asyncio.sleep(5)
                 continue
 
@@ -673,6 +690,42 @@ class TradingBot:
                 log.error("balance_sync_loop error (continuing): %s", exc)
                 await asyncio.sleep(10)
 
+    # ── Loop watchdog (Task 6) ────────────────────────────────────────────────
+
+    async def _watchdog_loop(self) -> None:
+        """
+        Task 6: Detect a stuck main loop.
+        If no heartbeat has been recorded in STALL_THRESHOLD_S seconds, send a
+        Telegram alert. Checks every 30 s to minimise overhead.
+        """
+        STALL_THRESHOLD_S = 120.0
+        CHECK_INTERVAL_S  = 30.0
+        # Give the bot time to complete its first cycle before arming the watchdog.
+        await asyncio.sleep(CHECK_INTERVAL_S * 2)
+        while not self._shutdown_flag:
+            try:
+                await asyncio.sleep(CHECK_INTERVAL_S)
+                elapsed = time.time() - self._last_heartbeat
+                if elapsed > STALL_THRESHOLD_S:
+                    log.error(
+                        "WATCHDOG: main loop stalled — no heartbeat for %.0fs "
+                        "(threshold=%.0fs)",
+                        elapsed, STALL_THRESHOLD_S,
+                    )
+                    try:
+                        await self.telegram.send(
+                            f"WATCHDOG ALERT: Main loop stalled\n"
+                            f"No iteration for {elapsed:.0f}s "
+                            f"(threshold: {STALL_THRESHOLD_S:.0f}s)\n"
+                            f"Bot may be stuck — check immediately."
+                        )
+                    except Exception:
+                        pass
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                log.warning("_watchdog_loop error (non-fatal): %s", exc)
+
     # ── Daily check ───────────────────────────────────────────────────────────
 
     async def _daily_check(self) -> None:
@@ -790,6 +843,14 @@ async def main() -> None:
         except Exception as exc:
             log.error("Startup/runtime failed: %s — restarting in 5s", exc, exc_info=True)
             if bot:
+                # Task 2 & 4: Alert before restart — never crash silently
+                try:
+                    await bot.telegram.send(
+                        f"CRITICAL ERROR: {exc}\n"
+                        f"Bot restarting in 5s — state will be restored."
+                    )
+                except Exception:
+                    pass
                 try:
                     await bot.stop()
                 except Exception:
