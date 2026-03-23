@@ -1,102 +1,32 @@
 {
-  "3b0bbd391c82319e": {
+  "c61387f7448cb60b": {
     "state": "FILLED",
-    "timestamp": 1774284594.9417024,
-    "placed_at": 1774284594.9486258,
-    "order_id": "paper_1774284594948",
+    "timestamp": 1774287051.3187065,
+    "placed_at": 1774287051.3411837,
+    "order_id": "paper_1774287051341",
     "market_id": "0x0f8ef3cc906ba7ba94a44724738df44bdd5f73e59e40c9c8b4ff8569e349643c",
     "side": "YES",
     "original_size": 42.0,
     "filled_size": 0.0
   },
-  "2310442dc2a69db3": {
+  "42be452586c469ba": {
     "state": "FILLED",
-    "timestamp": 1774284595.7310574,
-    "placed_at": 1774284595.7355387,
-    "order_id": "paper_1774284595735",
+    "timestamp": 1774287053.1532574,
+    "placed_at": 1774287053.1591957,
+    "order_id": "paper_1774287053159",
     "market_id": "0x450810ae738a0ff820d3248f2b24937f63fb8c8cf422ed2a915125adb4d9d3c8",
     "side": "YES",
     "original_size": 42.0,
     "filled_size": 0.0
   },
-  "5549ff682b8f6b22": {
+  "2407eeddf9518bf4": {
     "state": "FILLED",
-    "timestamp": 1774284596.261987,
-    "placed_at": 1774284596.265768,
-    "order_id": "paper_1774284596265",
+    "timestamp": 1774287054.374223,
+    "placed_at": 1774287054.3798833,
+    "order_id": "paper_1774287054379",
     "market_id": "0xd1747284d6048b2a3dcfbee489db405f36de18f9590197dd0e5c9f0c246bf050",
     "side": "YES",
     "original_size": 42.0,
-    "filled_size": 0.0
-  },
-  "5499f638ded30ba2": {
-    "state": "FILLED",
-    "timestamp": 1774284596.9255404,
-    "placed_at": 1774284596.931443,
-    "order_id": "paper_1774284596931",
-    "market_id": "0x8b203037c7c0e21b500314f8398d2a8ea294b7ce1f4f9185f426425a3505bc45",
-    "side": "YES",
-    "original_size": 42.0,
-    "filled_size": 0.0
-  },
-  "fee4c34925c1a8de": {
-    "state": "FILLED",
-    "timestamp": 1774284597.4682753,
-    "placed_at": 1774284597.4726124,
-    "order_id": "paper_1774284597472",
-    "market_id": "0x1945a8b23e313ed7423b6b6fd556f9ab5578900376b565a61dc480a5f4f35d21",
-    "side": "YES",
-    "original_size": 42.0,
-    "filled_size": 0.0
-  },
-  "58ea3378449d0781": {
-    "state": "FILLED",
-    "timestamp": 1774284601.1968858,
-    "placed_at": 1774284601.2054236,
-    "order_id": "paper_1774284601205",
-    "market_id": "0x0ac23db1e56971022bc7e822b907a2466c618b34104ea72bc9fa95e41c86a9c6",
-    "side": "YES",
-    "original_size": 42.0,
-    "filled_size": 0.0
-  },
-  "a156e4e5f71be6d8": {
-    "state": "FILLED",
-    "timestamp": 1774284601.739001,
-    "placed_at": 1774284601.7469997,
-    "order_id": "paper_1774284601746",
-    "market_id": "0x29283b56d3eec6d1d89fff51793d9d2e01579d2379b1d3e9ebda175d3561e809",
-    "side": "YES",
-    "original_size": 42.0,
-    "filled_size": 0.0
-  },
-  "b3e9de83235c0a19": {
-    "state": "FILLED",
-    "timestamp": 1774284602.273983,
-    "placed_at": 1774284602.2798743,
-    "order_id": "paper_1774284602279",
-    "market_id": "0x61a1278884fa70d68d4bcaaf72fad55bbdb063cac28c6947472ca91635fab10f",
-    "side": "YES",
-    "original_size": 42.0,
-    "filled_size": 0.0
-  },
-  "6fc18a25e96c7961": {
-    "state": "FILLED",
-    "timestamp": 1774284602.8102822,
-    "placed_at": 1774284602.8147843,
-    "order_id": "paper_1774284602814",
-    "market_id": "0x3265b10daeb30dbcc3214bd02e488551d0a5d3028392f4152e4750b943fbfc91",
-    "side": "YES",
-    "original_size": 42.0,
-    "filled_size": 0.0
-  },
-  "28d5497890346ebe": {
-    "state": "FILLED",
-    "timestamp": 1774284603.3391166,
-    "placed_at": 1774284603.3441072,
-    "order_id": "paper_1774284603344",
-    "market_id": "0x836b850fc838195374862551a36f1c8691d96ff01e58b0a071f0fc1a0e357fb1",
-    "side": "YES",
-    "original_size": 52.35,
     "filled_size": 0.0
   }
 }

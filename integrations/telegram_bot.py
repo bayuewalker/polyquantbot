@@ -42,7 +42,7 @@ class TelegramBot:
     KEYBOARD = [
         ["\u25b6\ufe0f Run",    "\u23f9\ufe0f Stop"],
         ["\U0001f4ca Status",  "\U0001f4b0 Wallet"],
-        ["\U0001f504 Reset CB"],
+        ["\U0001f525 Alpha",   "\U0001f504 Reset CB"],
     ]
 
     def __init__(self, token: str, chat_ids: list[str]) -> None:
@@ -100,6 +100,7 @@ class TelegramBot:
                 ("positions",    self._cmd_positions),
                 ("leaderboard",  self._cmd_leaderboard),
                 ("traderpnl",    self._cmd_trader_pnl),
+                ("alpha",        self._cmd_alpha),
             ]:
                 app.add_handler(CommandHandler(cmd, fn))
 
@@ -251,6 +252,68 @@ class TelegramBot:
             f"All trading halted. Send /reset to clear."
         )
 
+    async def alert_trade_opened(
+        self,
+        question: str,
+        side: str,
+        price: float,
+        size_usd: float,
+        ev: float,
+        z_score: float,
+        confidence: float,
+        social_boost: float,
+        liq_boost: float,
+        cash: float,
+        active_trades: int,
+    ) -> None:
+        conf_pct = round(confidence * 100, 1)
+        boost_line = ""
+        if social_boost != 0.0 or liq_boost != 0.0:
+            boost_line = (
+                f"\n<b>Boost:</b>\n"
+                f"Social: {social_boost:+.3f}\n"
+                f"Liquidity: {liq_boost:+.3f}"
+            )
+        await self.send(
+            f"<b>TRADE OPENED</b>\n\n"
+            f"Market: {html.escape(question[:60])}\n"
+            f"Side: <b>{side}</b>\n"
+            f"Price: {price:.4f}\n"
+            f"Size: <b>${size_usd:.2f}</b>\n\n"
+            f"<b>Signal:</b>\n"
+            f"EV: {ev:.3f}\n"
+            f"Z-Score: {z_score:.2f}\n"
+            f"Confidence: {conf_pct}%"
+            f"{boost_line}\n\n"
+            f"<b>Portfolio:</b>\n"
+            f"Cash: ${cash:.2f}\n"
+            f"Positions: {active_trades}"
+        )
+
+    async def alert_trade_closed(
+        self,
+        question: str,
+        side: str,
+        exit_price: float,
+        pnl: float,
+        pnl_pct: float,
+        reason: str,
+        hold_minutes: int,
+        balance: float,
+    ) -> None:
+        pnl_sign = "+" if pnl >= 0 else ""
+        await self.send(
+            f"<b>POSITION CLOSED</b>\n\n"
+            f"Market: {html.escape(question[:60])}\n"
+            f"Side: {side}\n"
+            f"Exit Price: {exit_price:.4f}\n"
+            f"PnL: <b>{pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_pct:.1f}%)</b>\n"
+            f"Reason: {reason}\n"
+            f"Duration: {hold_minutes} min\n\n"
+            f"<b>Portfolio:</b>\n"
+            f"Balance: ${balance:.2f}"
+        )
+
     # ── Commands ──────────────────────────────────────────────────────────────
 
     async def _cmd_start(self, update: "Update", context) -> None:
@@ -269,6 +332,7 @@ class TelegramBot:
             "/pnl                         \u2014 local portfolio PnL\n"
             "/pnl &lt;wallet&gt; [days]   \u2014 trader PnL + Wallet 360\n"
             "/positions                   \u2014 detailed positions\n"
+            "/alpha                       \u2014 top opportunities this scan\n"
             "/leaderboard [1d|7d|30d]     \u2014 top traders leaderboard\n"
             "/traderpnl &lt;wallet&gt; [days] \u2014 trader PnL + profile",
             parse_mode="HTML",
@@ -670,6 +734,33 @@ class TelegramBot:
             parse_mode="HTML",
         )
 
+    async def _cmd_alpha(self, update: "Update", context) -> None:
+        if not self._auth(update):
+            return
+        if not self._bot:
+            await update.message.reply_text("Bot not initialised."); return
+        signals = getattr(self._bot, "_top_signals", [])
+        if not signals:
+            await update.message.reply_text(
+                "No signals yet — waiting for next scan cycle."
+            )
+            return
+        lines = ["<b>TOP ALPHA SIGNALS</b>\n"]
+        for i, s in enumerate(signals[:5], 1):
+            boost_txt = ""
+            if s.get("social", 0) != 0 or s.get("liq", 0) != 0:
+                boost_txt = f"  Social: {s['social']:+.3f}  Liq: {s['liq']:+.3f}\n"
+            lines.append(
+                f"{i}. {html.escape(s['title'][:50])}\n"
+                f"EV: {s['ev']:.3f}  Z: {s['z']:.2f}  Prob: {s['prob']:.2f}\n"
+                f"Size: ${s['size']:.2f} @ {s['price']:.4f}\n"
+                f"{boost_txt}"
+            )
+        try:
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        except Exception as exc:
+            log.warning("_cmd_alpha send error: %s", exc)
+
     async def _handle_text(self, update: "Update", context) -> None:
         if not self._auth(update):
             return
@@ -678,6 +769,7 @@ class TelegramBot:
         elif "\u23f9" in text:     await self._cmd_stop(update, context)
         elif "Status" in text:     await self._cmd_status(update, context)
         elif "Wallet" in text:     await self._cmd_wallet(update, context)
+        elif "Alpha" in text:      await self._cmd_alpha(update, context)
         elif "Reset" in text:      await self._cmd_reset(update, context)
         else:                      await self._cmd_start(update, context)
 
