@@ -10,6 +10,7 @@ channel = "stable-25_05"
 [userenv.shared]
 TELEGRAM_TOKEN = "8795145097:AAHQjB25hUqsxGGg3rclmV2ir-vT9SYdQZY"
 TELEGRAM_CHAT_IDS = "-1002705155458"
+PAPER_BALANCE = "1000"
 
 [workflows]
 runButton = "Project"

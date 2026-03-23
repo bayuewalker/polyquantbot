@@ -265,13 +265,21 @@ class TradingBot:
         tg_token    = _env("TELEGRAM_TOKEN")
         tg_chats    = _env_list("TELEGRAM_CHAT_IDS")
 
+        # Task 1: Paper balance seed — read from env, default $1,000
+        # Only applied in paper mode; live mode uses real wallet balance.
+        self._paper_balance: float = (
+            float(os.getenv("PAPER_BALANCE", "1000"))
+            if paper else 0.0
+        )
+
         # ── Client ────────────────────────────────────────────────────────────
         self.client = PolymarketClient(
             cfg=m_cfg, private_key=private_key, maker_address=maker_addr,
         )
 
         # ── Portfolio + position manager ──────────────────────────────────────
-        self.portfolio        = Portfolio(initial_cash=0.0)
+        # Task 2: Seed cash/total_value/peak_value from PAPER_BALANCE on startup
+        self.portfolio        = Portfolio(initial_cash=self._paper_balance)
         self.position_manager = PositionManager(
             portfolio=self.portfolio, cfg=t_cfg
         )
@@ -365,12 +373,20 @@ class TradingBot:
         asyncio.create_task(self._watchdog_loop(),                  name="loop_watchdog")
 
         try:
-            await self.telegram.send(
-                f"PolyBot v7.1 started\n"
-                f"Mode: {'PAPER' if self.client.is_paper_trading() else 'LIVE'}\n"
-                f"Balance: ${self.portfolio.total_value:.2f} USDC\n"
-                f"Send /run to start trading"
-            )
+            if self.client.is_paper_trading():
+                # Task 4: Paper mode confirmation with seeded balance
+                await self.telegram.send(
+                    f"PAPER MODE ACTIVE | Balance: ${self.portfolio.total_value:.2f}\n"
+                    f"PolyBot v7.1 started\n"
+                    f"Send /run to start trading"
+                )
+            else:
+                await self.telegram.send(
+                    f"PolyBot v7.1 started\n"
+                    f"Mode: LIVE\n"
+                    f"Balance: ${self.portfolio.total_value:.2f} USDC\n"
+                    f"Send /run to start trading"
+                )
         except Exception:
             pass
 
