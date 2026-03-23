@@ -191,6 +191,8 @@ class OrderbookEvaluator:
         if not ob:
             # CLOB unavailable (AMM-only market or no active orders) — treat as no_ob_fallback
             return {**_empty, "allow": True, "reason": "no_ob_fallback",
+                    "best_bid": 0.49, "best_ask": 0.51,
+                    "spread": 0.02, "spread_pct": 0.02,
                     "liquidity_score": 0.15, "fill_prob": 0.50}
 
         def parse(raw: list) -> list[dict]:
@@ -210,6 +212,8 @@ class OrderbookEvaluator:
 
         if not bids or not asks:
             return {**_empty, "allow": True, "reason": "no_ob_fallback",
+                    "best_bid": 0.49, "best_ask": 0.51,
+                    "spread": 0.02, "spread_pct": 0.02,
                     "liquidity_score": 0.15, "fill_prob": 0.50}
 
         bb   = bids[0]["price"]
