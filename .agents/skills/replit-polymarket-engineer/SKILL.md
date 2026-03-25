@@ -4,7 +4,7 @@ description: >
 Activates production-grade behavior for building Polymarket CLOB trading systems on Replit.
 Use this skill whenever the user is working on a trading bot, Polymarket integration, CLOB
 execution engine, wallet manager, signal generator, risk module, or any backend system
-involving real funds. Also triggers on: versioning discipline, changelog enforcement,
+involving real funds. Also triggers on versioning discipline, changelog enforcement,
 PATCH-style code edits, blockchain backend work, or any mention of Polymarket, CLOB,
 prediction markets, or live trading infrastructure. Always use this skill when the user
 is in a Replit environment building or maintaining a trading system.
