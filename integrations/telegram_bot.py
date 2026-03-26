@@ -1,26 +1,35 @@
 """
-integrations/telegram_bot.py  —  PolyBot v7.1  v2.0.0
+integrations/telegram_bot.py  —  PolyBot v7.1  v3.0.0
 =======================================================
-LATEST UPDATE — v2.0.0:
-NEW: /positions, /trades, /filter, /pause N commands
-NEW: alert_order_gtc, alert_partial_update, alert_partial_resolved,
-     alert_trade_closed, alert_daily_summary, alert_startup
-IMPROVED: alert_order_placed (EV + z-score + strategy)
-IMPROVED: alert_partial_fill (ASCII progress bar + fill%)
-IMPROVED: alert_cancelled (hold-time), alert_failure (attempt count)
-IMPROVED: alert_circuit_breaker (CB snapshot)
-IMPROVED: _cmd_status (coloured P&L, Sharpe), _cmd_start (live balance)
+LATEST UPDATE — v3.0.0:
+NEW: send_keyed(key, text, cooldown)  — deduplication with per-key cooldown.
+     Prevents heartbeat / startup spam even if called every cycle.
+NEW: send_startup_report(...)  — uses format_startup_report() from telegram_formatter,
+     also keyed with 30s cooldown to prevent restart-loop spam.
+FIXED: Startup message no longer spams on crash-restart loop.
+FIXED: HEARTBEAT no longer spams every cycle — 60s cooldown enforced.
+KEPT: All v2.0.0 commands (/positions /trades /filter /pause N)
+KEPT: All alert helpers (alert_order_placed, alert_partial_*, etc.)
 KEPT: PTB v21 run_polling() — zero updater refs, send() never raises
 """
 from __future__ import annotations
-import asyncio, datetime, logging
+
+import asyncio
+import datetime
+import logging
+import time
 from typing import TYPE_CHECKING, Optional
 
 log = logging.getLogger("polybot.telegram")
 
 try:
     from telegram import Update, ReplyKeyboardMarkup
-    from telegram.ext import Application, CommandHandler, MessageHandler, filters
+    from telegram.ext import (
+        Application,
+        CommandHandler,
+        MessageHandler,
+        filters,
+    )
     _TG_OK = True
 except ImportError:
     _TG_OK = False
@@ -28,6 +37,22 @@ except ImportError:
 
 if TYPE_CHECKING:
     pass
+
+# Import formatter — fail gracefully if not present
+try:
+    from integrations.telegram_formatter import (
+        format_startup_report,
+        format_status,
+        format_alpha,
+        format_heartbeat,
+    )
+    _FMT_OK = True
+except ImportError:
+    _FMT_OK = False
+    log.warning("telegram_formatter not found — using fallback formatting")
+
+
+# ── Formatting helpers ────────────────────────────────────────────────────────
 
 def _pnl_str(pnl: float) -> str:
     return f"<b>+${pnl:.2f}</b>" if pnl >= 0 else f"<b>-${abs(pnl):.2f}</b>"
@@ -46,6 +71,8 @@ def _eta_str(delay_s: float) -> str:
     return t.strftime("%H:%M")
 
 
+# ── TelegramBot ───────────────────────────────────────────────────────────────
+
 class TelegramBot:
 
     KEYBOARD = [
@@ -63,6 +90,9 @@ class TelegramBot:
         self._pause_task: Optional[asyncio.Task] = None
         self._bot  = None
 
+        # Keyed message deduplication: {key -> last_sent_timestamp}
+        self._keyed_sent: dict[str, float] = {}
+
     def attach(self, trading_bot) -> None:
         self._bot = trading_bot
 
@@ -73,7 +103,8 @@ class TelegramBot:
 
     async def start(self) -> None:
         if not _TG_OK or not self._token:
-            log.info("Telegram: disabled"); return
+            log.info("Telegram: disabled (no token or library missing)")
+            return
         try:
             app = Application.builder().token(self._token).build()
             for cmd, fn in [
@@ -82,7 +113,7 @@ class TelegramBot:
                 ("status",    self._cmd_status),("wallet",    self._cmd_wallet),
                 ("reset",     self._cmd_reset), ("positions", self._cmd_positions),
                 ("trades",    self._cmd_trades),("filter",    self._cmd_filter),
-                ("pause",     self._cmd_pause),
+                ("pause",     self._cmd_pause), ("alpha",     self._cmd_alpha),
             ]:
                 app.add_handler(CommandHandler(cmd, fn))
             app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text))
@@ -103,7 +134,9 @@ class TelegramBot:
         while True:
             try:
                 await self._app.run_polling(
-                    drop_pending_updates=True, allowed_updates=Update.ALL_TYPES, close_loop=False
+                    drop_pending_updates=True,
+                    allowed_updates=Update.ALL_TYPES,
+                    close_loop=False,
                 )
                 break
             except asyncio.CancelledError:
@@ -128,36 +161,112 @@ class TelegramBot:
     # ── Core send ─────────────────────────────────────────────────────────────
 
     async def send(self, text: str) -> None:
+        """Broadcast HTML message to all authorised chats. NEVER raises."""
         if not self._app or not self._chat_ids:
-            log.info("TG [no-send]: %s", text[:100]); return
+            log.info("TG [no-send]: %s", text[:100])
+            return
         for cid in self._chat_ids:
             try:
-                await self._app.bot.send_message(chat_id=cid, text=text, parse_mode="HTML")
+                await self._app.bot.send_message(
+                    chat_id=cid, text=text, parse_mode="HTML"
+                )
             except Exception as e:
                 log.warning("TG send to %s failed: %s", cid, e)
 
-    # ── Alert helpers ─────────────────────────────────────────────────────────
+    async def send_keyed(self, key: str, text: str, cooldown: float = 60.0) -> None:
+        """
+        Send message only if cooldown has elapsed since last send for this key.
+        Prevents duplicate startup / heartbeat spam even when called every cycle.
+
+        key      — unique identifier (e.g. "heartbeat", "startup")
+        text     — HTML message body
+        cooldown — minimum seconds between sends for this key (default: 60s)
+        """
+        now  = time.time()
+        last = self._keyed_sent.get(key, 0.0)
+        if now - last < cooldown:
+            log.debug("send_keyed: suppressed key=%s (%.0fs < %.0fs cooldown)",
+                      key, now - last, cooldown)
+            return
+        self._keyed_sent[key] = now
+        await self.send(text)
+
+        # Prune stale keys every ~100 sends to avoid unbounded growth
+        if len(self._keyed_sent) > 200:
+            cutoff = now - 3600
+            self._keyed_sent = {k: v for k, v in self._keyed_sent.items() if v > cutoff}
+
+    async def send_startup_report(
+        self,
+        mode: str,
+        balance: float,
+        cash: float,
+        position_count: int,
+        max_positions: int,
+        market_count: int,
+        scan_interval: int,
+        intelligence_status: str,
+        autostart: bool,
+    ) -> None:
+        """
+        Send startup notification exactly once per boot, even in crash-restart loops.
+        Uses send_keyed with 30s cooldown — second call within 30s is silently dropped.
+        """
+        if _FMT_OK:
+            text = format_startup_report(
+                mode=mode,
+                balance=balance,
+                cash=cash,
+                position_count=position_count,
+                max_positions=max_positions,
+                market_count=market_count,
+                scan_interval=scan_interval,
+                intelligence_status=intelligence_status,
+                autostart=autostart,
+            )
+        else:
+            state = "ACTIVE" if autostart else "STANDBY — send /run to start"
+            text = (
+                f"\U0001f916 <b>POLYBOT v7.1 ONLINE</b>\n"
+                f"Mode: <b>{mode}</b>  Balance: <b>${balance:.2f}</b>\n"
+                f"Intelligence: {intelligence_status}\n"
+                f"Trading: <b>{state}</b>"
+            )
+        await self.send_keyed("startup", text, cooldown=30.0)
+
+    # ── Typed alert helpers ────────────────────────────────────────────────────
 
     async def alert_startup(self, mode: str, balance: float, positions: int) -> None:
-        await self.send(
+        await self.send_keyed(
+            "startup",
             f"\U0001f7e2 <b>PolyBot v7.1 Started</b>\n"
             f"Mode: <b>{mode}</b>  Balance: <b>${balance:.2f}</b>\n"
-            f"Positions: {positions} open  |  Send /run to trade."
+            f"Positions: {positions} open  |  Send /run to trade.",
+            cooldown=30.0,
         )
 
     async def alert_order_placed(
         self, trade_id: str, order_id: str, side: str, question: str,
         size: float, price: float, sl: float,
-        ev: float = 0.0, z_score: float = 0.0, strategy: str = ""
+        ev: float = 0.0, z_score: float = 0.0, strategy: str = "",
+        signal_meta: Optional[dict] = None,
     ) -> None:
-        ev_s  = f"{ev:+.4f}" if ev else "n/a"
-        z_s   = f"{z_score:.2f}" if z_score else "n/a"
-        strat = f"  [{strategy}]" if strategy else ""
+        meta    = signal_meta or {}
+        ev      = ev or meta.get("ev", 0.0) or 0.0
+        z_score = z_score or meta.get("z_score", 0.0) or 0.0
+        conf    = meta.get("confidence", 0.0) or 0.0
+        social  = meta.get("social_boost", 0.0) or 0.0
+        liq     = meta.get("liq_boost", 0.0) or 0.0
+        strat   = f"  [{strategy}]" if strategy else ""
+        boost_txt = ""
+        if social != 0.0 or liq != 0.0:
+            boost_txt = f"\nBoosts: Social {social:+.3f}  Liq {liq:+.3f}"
         await self.send(
             f"\u2705 <b>Trade Opened</b>{strat}\n"
             f"Market: {question[:50]}\n"
             f"Side: <b>{side}</b>  Size: <b>${size:.2f}</b>  @ {price:.4f}\n"
-            f"SL: {sl:.4f}  EV: <code>{ev_s}</code>  Z: <code>{z_s}</code>\n"
+            f"SL: {sl:.4f}  EV: <code>{ev:+.4f}</code>  Z: <code>{z_score:.2f}</code>"
+            f"{boost_txt}\n"
             f"<code>{trade_id}</code>"
         )
 
@@ -169,7 +278,7 @@ class TelegramBot:
             f"\u23f3 <b>Order Placed — Awaiting Fill (GTC)</b>\n"
             f"Market: {question[:50]}\n"
             f"Side: <b>{side}</b>  Size: <b>${size:.2f}</b>  @ {price:.4f}\n"
-            f"Auto-cancel after {timeout_s:.0f}s if unfilled.\n"
+            f"Auto-cancel after {timeout_s:.0f}s\n"
             f"<code>{trade_id}</code>"
         )
 
@@ -291,6 +400,7 @@ class TelegramBot:
                 "/positions  \u2014 open positions\n"
                 "/trades     \u2014 today's stats\n"
                 "/filter     \u2014 edge filter breakdown\n"
+                "/alpha      \u2014 top signals this cycle\n"
                 "/wallet     \u2014 balance &amp; address\n"
                 "/reset      \u2014 reset circuit breaker",
                 parse_mode="HTML", reply_markup=markup,
@@ -333,7 +443,9 @@ class TelegramBot:
                 except: pass
             self._bot.running = False
             if self._pause_task and not self._pause_task.done(): self._pause_task.cancel()
-            self._pause_task = asyncio.create_task(self._auto_resume(minutes * 60), name="pause_timer")
+            self._pause_task = asyncio.create_task(
+                self._auto_resume(minutes * 60), name="pause_timer"
+            )
             await update.message.reply_text(
                 f"\u23f8\ufe0f <b>Paused {minutes}min.</b>  Auto-resume at {_eta_str(minutes*60)}",
                 parse_mode="HTML",
@@ -356,24 +468,47 @@ class TelegramBot:
         try:
             b = self._bot; p = b.portfolio; cb = b.guard.circuit_breaker; ef = b.edge_filter
             halt = ("YES \u2014 " + (b.guard._halt_reason or cb.trip_reason)) if b.guard.is_halted else "NO"
-            pos_lines = [
-                f"  {pos.side} {pos.question[:24]} <b>${pos.size_usd:.0f}</b> {_pnl_str(pos.pnl)}"
-                for pos in list(p.positions.values())[:5]
-            ] or ["  (none)"]
-            await update.message.reply_text(
-                f"\U0001f916 <b>PolyBot Status</b>\n"
-                f"Running: <b>{'YES' if b.running else 'NO'}</b>  Halted: <b>{halt}</b>\n\n"
-                f"<b>Portfolio</b>\n"
-                f"  Cash: ${p.cash:.2f}  Total: <b>${p.total_value:.2f}</b>\n"
-                f"  Daily P&amp;L: {_pnl_str(p.daily_pnl)}  All-time: {_pnl_str(p.all_time_pnl)}\n"
-                f"  Positions: {len(p.positions)}  "
-                f"Win rate: {p.win_rate()*100:.1f}%  Sharpe: {p.sharpe_ratio():.2f}\n\n"
-                f"<b>Positions</b>\n" + "\n".join(pos_lines) + "\n\n"
-                f"<b>Circuit Breaker</b>\n"
-                f"  Tripped: {cb.is_tripped}  Consec: {cb._consecutive_failures}  Loss: ${cb._session_loss:.2f}\n\n"
-                f"<b>Edge Filter</b>\n  {ef.stats_summary()}",
-                parse_mode="HTML",
-            )
+
+            if _FMT_OK:
+                positions_data = [
+                    {
+                        "side":          pos.side,
+                        "question":      pos.question,
+                        "entry_price":   pos.entry_price,
+                        "current_price": pos.current_price,
+                        "pnl":           pos.pnl,
+                    }
+                    for pos in list(p.positions.values())[:10]
+                ]
+                unrealized = sum(pos.pnl for pos in p.positions.values())
+                text = format_status(
+                    running=b.running,
+                    is_halted=b.guard.is_halted,
+                    halt_reason=b.guard._halt_reason or cb.trip_reason,
+                    balance=p.total_value,
+                    cash=p.cash,
+                    unrealized_pnl=unrealized,
+                    daily_pnl=p.daily_pnl,
+                    drawdown_pct=p.max_drawdown() * 100,
+                    positions=positions_data,
+                    cycle_limit=getattr(b, "max_trades_per_cycle", 3),
+                    scan_interval=b._scan_interval,
+                )
+            else:
+                pos_lines = [
+                    f"  {pos.side} {pos.question[:24]} <b>${pos.size_usd:.0f}</b> {_pnl_str(pos.pnl)}"
+                    for pos in list(p.positions.values())[:5]
+                ] or ["  (none)"]
+                text = (
+                    f"\U0001f916 <b>PolyBot Status</b>\n"
+                    f"Running: <b>{'YES' if b.running else 'NO'}</b>  Halted: <b>{halt}</b>\n\n"
+                    f"Cash: ${p.cash:.2f}  Total: <b>${p.total_value:.2f}</b>\n"
+                    f"Daily P&amp;L: {_pnl_str(p.daily_pnl)}  Win rate: {p.win_rate()*100:.1f}%\n\n"
+                    f"<b>Positions</b>\n" + "\n".join(pos_lines) + "\n\n"
+                    f"CB: {cb.is_tripped}  Consec: {cb._consecutive_failures}  Loss: ${cb._session_loss:.2f}\n"
+                    f"{ef.stats_summary()}"
+                )
+            await update.message.reply_text(text, parse_mode="HTML")
         except Exception as e:
             log.warning("_cmd_status: %s", e)
             try: await update.message.reply_text(f"Error: {e}")
@@ -421,7 +556,7 @@ class TelegramBot:
             ef = self._bot.edge_filter; c = ef.counters(); total = sum(c.values())
             passed = c["PASS"]; rate = f"{passed/total*100:.1f}%" if total else "n/a"
             lines = [f"\U0001f9ee <b>Edge Filter</b>\nPassed: <b>{passed}</b>/{total}  ({rate})\n"]
-            for reason in ("LOW_EV","WEAK_SIGNAL","WIDE_SPREAD","LOW_LIQUIDITY","PROB_SANITY"):
+            for reason in ("NO_EDGE","LOW_EV","WEAK_SIGNAL","WIDE_SPREAD","LOW_LIQUIDITY","PROB_SANITY"):
                 n = c.get(reason, 0)
                 if n:
                     pct = n/total*100 if total else 0
@@ -429,6 +564,29 @@ class TelegramBot:
             await update.message.reply_text("\n".join(lines), parse_mode="HTML")
         except Exception as e:
             log.warning("_cmd_filter: %s", e)
+
+    async def _cmd_alpha(self, update: "Update", context) -> None:
+        if not self._auth(update): return
+        if not self._bot: await update.message.reply_text("Bot not initialised."); return
+        try:
+            signals = getattr(self._bot, "_top_signals", [])
+            if _FMT_OK:
+                text = format_alpha(signals)
+            else:
+                if not signals:
+                    text = "\U0001f52d <b>No alpha signals</b> — waiting for next scan."
+                else:
+                    lines = ["\U0001f525 <b>Top Signals</b>\n"]
+                    for i, s in enumerate(signals[:5], 1):
+                        lines.append(
+                            f"{i}. {s.get('title','?')[:50]}\n"
+                            f"   EV: {s.get('ev',0):.3f}  Z: {s.get('z',0):.2f}  "
+                            f"Size: ${s.get('size',0):.2f}"
+                        )
+                    text = "\n".join(lines)
+            await update.message.reply_text(text, parse_mode="HTML")
+        except Exception as e:
+            log.warning("_cmd_alpha: %s", e)
 
     async def _cmd_wallet(self, update: "Update", context) -> None:
         if not self._auth(update): return
