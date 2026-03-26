@@ -1,5 +1,5 @@
 """
-integrations/telegram_bot.py  —  PolyBot v7.1  v3.0.0
+integrations/telegram_bot.py  —  PolyBot v7.1  v3.1.0
 =======================================================
 LATEST UPDATE — v3.0.0:
 NEW: send_keyed(key, text, cooldown)  — deduplication with per-key cooldown.
@@ -10,7 +10,7 @@ FIXED: Startup message no longer spams on crash-restart loop.
 FIXED: HEARTBEAT no longer spams every cycle — 60s cooldown enforced.
 KEPT: All v2.0.0 commands (/positions /trades /filter /pause N)
 KEPT: All alert helpers (alert_order_placed, alert_partial_*, etc.)
-KEPT: PTB v21 run_polling() — zero updater refs, send() never raises
+FIXED: run_polling() replaced with app.start()+updater.start_polling() — no event loop conflict
 """
 from __future__ import annotations
 
@@ -130,33 +130,60 @@ class TelegramBot:
             self._app = self._task = None
 
     async def _polling_task(self) -> None:
-        if not self._app: return
+        """
+        PTB v21 correct async pattern when running inside an existing event loop.
+        Do NOT use run_polling() — it tries to manage its own loop and conflicts
+        with asyncio.run() in the main entry point.
+        Instead: app.start() → updater.start_polling() → block until cancelled.
+        """
+        if not self._app:
+            return
         while True:
             try:
-                await self._app.run_polling(
+                await self._app.start()
+                await self._app.updater.start_polling(
                     drop_pending_updates=True,
                     allowed_updates=Update.ALL_TYPES,
-                    close_loop=False,
                 )
+                log.info("Telegram: updater polling active")
+                # Block here until task is cancelled
+                while not self._app.updater.running is False:
+                    await asyncio.sleep(1)
                 break
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 log.error("Telegram polling error — restart 10s: %s", e)
+                try:
+                    await self._app.updater.stop()
+                except Exception:
+                    pass
+                try:
+                    await self._app.stop()
+                except Exception:
+                    pass
                 await asyncio.sleep(10)
 
     async def stop(self) -> None:
         for task in (self._pause_task, self._task):
             if task and not task.done():
                 task.cancel()
-                try: await task
-                except: pass
-        if not self._app: return
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        if not self._app:
+            return
+        try:
+            if self._app.updater and self._app.updater.running:
+                await self._app.updater.stop()
+        except Exception as e:
+            log.warning("Telegram updater stop error: %s", e)
         try:
             await self._app.stop()
             await self._app.shutdown()
         except Exception as e:
-            log.warning("Telegram stop error: %s", e)
+            log.warning("Telegram app stop error: %s", e)
 
     # ── Core send ─────────────────────────────────────────────────────────────
 
