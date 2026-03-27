@@ -69,8 +69,8 @@ intelligence_api:
 
   # Feature toggles — all fail-open via safe_intelligence_call (never block trading)
   market_insights_enabled: true
-  candlestick_enabled: false
-  orderbook_crosscheck_enabled: false
+  candlestick_enabled: true
+  orderbook_crosscheck_enabled: true
   social_pulse_enabled: true
   copy_trading_enabled: false
 
@@ -82,6 +82,13 @@ intelligence_api:
   candlestick_interval: "1h"
   candlestick_limit: 24
   candlestick_ema_period: 6
+  candlestick_bearish_threshold: -0.05
+  candlestick_ev_dampen_factor: 0.1
+
+  # Orderbook crosscheck (agent 572)
+  orderbook_crosscheck_max_spread: 0.06
+  orderbook_crosscheck_min_depth: 100.0
+  orderbook_crosscheck_max_age_sec: 300
 
   # Social Pulse thresholds (agent 585)
   social_pulse_accel_boost: 1.5

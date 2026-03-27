@@ -42,6 +42,13 @@ from core.execution_guard   import ExecutionGuard
 from core.persistence       import PersistenceManager
 from core.position_manager  import Portfolio, PositionManager
 from execution.order_manager import OrderManager
+from integrations.intelligence_client import (
+    IntelligenceClient,
+    IntelligenceAPIError,
+    compute_momentum,
+    extract_keywords,
+    unix_seconds_ago,
+)
 from integrations.polymarket_client import PolymarketClient
 from integrations.telegram_bot      import TelegramBot
 
@@ -333,6 +340,17 @@ class TradingBot:
         self._price_max       = float(t_cfg.get("price_max",         0.95))
         self._min_liq         = float(t_cfg.get("min_liquidity_usd", 10000.0))
 
+        # ── Intelligence API ──────────────────────────────────────────────────
+        self._i_cfg = cfg.get("intelligence_api", {})
+        self.intelligence = IntelligenceClient(
+            base_url=self._i_cfg.get("base_url", "https://narrative.agent.heisenberg.so"),
+            api_key=_env("INTELLIGENCE_API_KEY"),
+        )
+        # Market Insights cycle cache: {condition_id -> insight_data}
+        self._mi_cache: dict[str, dict] = {}
+        # Copy-trade alert dedup: {wallet:condition_id -> sent_timestamp}
+        self._copy_trade_sent: dict[str, float] = {}
+
         self._sent_cooldown: dict[str, float] = {}
         self._last_daily    = datetime.now(timezone.utc).date()
         self._scan_count    = 0
@@ -342,10 +360,12 @@ class TradingBot:
 
     async def start(self) -> None:
         await self.client.start()
+        await self.intelligence.start()
         log.info(
-            "PolyBot v7.1 started | paper=%s wallet=%s",
+            "PolyBot v7.1 started | paper=%s wallet=%s intel=%s",
             self.client.is_paper_trading(),
             (self.client.wallet_address[:10] + "...") if self.client.wallet_address else "none",
+            "ONLINE" if self.intelligence.available else "OFFLINE",
         )
 
         # Sync balance (exchange is source of truth)
@@ -362,10 +382,17 @@ class TradingBot:
         asyncio.create_task(self.order_manager.maintenance_loop(), name="order_maintenance")
         asyncio.create_task(self._balance_sync_loop(),              name="balance_sync")
 
+        # Copy-trading pipeline (runs only when enabled and intelligence API is available)
+        if self._i_cfg.get("copy_trading_enabled", False):
+            asyncio.create_task(self._copy_trading_loop(), name="copy_trading")
+
         try:
+            mode         = "PAPER" if self.client.is_paper_trading() else "LIVE"
+            intel_status = "ONLINE" if self.intelligence.available else "OFFLINE"
             await self.telegram.send(
                 f"PolyBot v7.1 started\n"
-                f"Mode: {'PAPER' if self.client.is_paper_trading() else 'LIVE'}\n"
+                f"Mode: {mode}\n"
+                f"Intelligence: {intel_status}\n"
                 f"Balance: ${self.portfolio.total_value:.2f} USDC\n"
                 f"Send /run to start trading"
             )
@@ -416,10 +443,24 @@ class TradingBot:
         except Exception as exc:
             log.warning("Telegram stop error: %s", exc)
         try:
+            await self.intelligence.stop()
+        except Exception as exc:
+            log.warning("Intelligence stop error: %s", exc)
+        try:
             await self.client.stop()
         except Exception as exc:
             log.warning("Client stop error: %s", exc)
         log.info("PolyBot stopped cleanly")
+
+    # ── Safe intelligence wrapper ──────────────────────────────────────────────
+
+    async def safe_intelligence_call(self, fn, *args, **kwargs):
+        """Wrapper for all Intelligence API calls — always fail-open (never blocks trading)."""
+        try:
+            return await fn(*args, **kwargs)
+        except Exception as exc:
+            log.warning("INTEL_FAIL: %s", exc)
+            return None
 
     # ── State recovery ────────────────────────────────────────────────────────
 
@@ -487,6 +528,32 @@ class TradingBot:
             log.warning("No markets returned from API")
             return
 
+        # ── Market Insights enrichment (agent 575) ────────────────────────────
+        # Pre-fetch once per scan cycle and cache by condition_id.
+        # Fail-open: empty or failed response never blocks trading.
+        self._mi_cache = {}
+        if self._i_cfg.get("market_insights_enabled", False) and self.intelligence.available:
+            insights = await self.safe_intelligence_call(
+                self.intelligence.get_market_insights,
+                volume_trend=self._i_cfg.get("market_insights_volume_trend", "UP"),
+                min_liquidity_percentile=self._i_cfg.get(
+                    "market_insights_min_liquidity_percentile", "60"
+                ),
+                limit=300,
+            )
+            if insights:
+                for item in insights:
+                    cid_val = (
+                        item.get("condition_id")
+                        or item.get("conditionId")
+                        or item.get("market_id")
+                        or item.get("id")
+                        or ""
+                    )
+                    if cid_val:
+                        self._mi_cache[cid_val] = item
+                log.info("Market Insights: %d markets cached for signal boost", len(self._mi_cache))
+
         candidates: list[dict] = []
         seen: set[str] = set()
 
@@ -551,7 +618,84 @@ class TradingBot:
         if r["ev"] <= 0:
             return
 
-        # Orderbook
+        # ── Candlestick momentum gate (agent 568) ────────────────────────────
+        # Bearish momentum dampens effective model probability (fail-open).
+        ev_momentum_adj = 0.0
+        if self._i_cfg.get("candlestick_enabled", False) and self.intelligence.available and tok_id:
+            try:
+                candles = await self.intelligence.get_candlesticks(
+                    token_id=tok_id,
+                    interval=self._i_cfg.get("candlestick_interval", "1h"),
+                    start_time=unix_seconds_ago(
+                        int(self._i_cfg.get("candlestick_limit", 24)) * 3600
+                    ),
+                )
+                if candles:
+                    momentum = compute_momentum(
+                        candles,
+                        ema_period=int(self._i_cfg.get("candlestick_ema_period", 6)),
+                    )
+                    if momentum is not None:
+                        bearish_thresh = float(self._i_cfg.get("candlestick_bearish_threshold", -0.05))
+                        dampen_factor  = float(self._i_cfg.get("candlestick_ev_dampen_factor", 0.1))
+                        log.info("Candlestick momentum [%s]: %.4f", cid[:12], momentum)
+                        if momentum < bearish_thresh:
+                            ev_momentum_adj = momentum * dampen_factor
+                            log.info(
+                                "Candlestick bearish [%s]: momentum=%.4f → ev_adj=%.4f",
+                                cid[:12], momentum, ev_momentum_adj,
+                            )
+            except Exception as exc:
+                log.warning("Candlestick fetch failed %s (non-fatal): %s", cid[:12], exc)
+
+        # ── Social Pulse boost/penalty (agent 585) ───────────────────────────
+        # Adjusts model probability; never blocks trading on its own (fail-open).
+        social_boost = 0.0
+        if self._i_cfg.get("social_pulse_enabled", False) and self.intelligence.available:
+            keywords = extract_keywords(question)
+            if keywords:
+                pulse = await self.safe_intelligence_call(
+                    self.intelligence.get_social_pulse, keywords
+                )
+                if pulse:
+                    accel      = float(pulse.get("acceleration", 1.0) or 1.0)
+                    diversity  = float(pulse.get("author_diversity_pct", 50.0) or 50.0)
+                    accel_thr  = float(self._i_cfg.get("social_pulse_accel_boost", 1.5))
+                    div_min    = float(self._i_cfg.get("social_pulse_diversity_min", 40.0))
+                    ev_boost   = float(self._i_cfg.get("social_pulse_ev_boost", 0.02))
+                    ev_penalty = float(self._i_cfg.get("social_pulse_ev_penalty", 0.015))
+                    if accel > accel_thr and diversity >= div_min:
+                        social_boost = min(0.10, (accel - 1) * 0.05)
+                        log.info(
+                            "Social Pulse BOOST [%s]: accel=%.2f diversity=%.1f%% +%.3f",
+                            cid[:12], accel, diversity, social_boost,
+                        )
+                    elif diversity < div_min:
+                        social_boost = -ev_penalty
+                        log.info(
+                            "Social Pulse REDUCE [%s]: diversity=%.1f%% %.3f",
+                            cid[:12], diversity, social_boost,
+                        )
+
+        # ── Market Insights liquidity boost (cycle-cached, agent 575) ────────
+        liquidity_boost = 0.0
+        if self._i_cfg.get("market_insights_enabled", False):
+            mi_data = self._mi_cache.get(cid, {})
+            if mi_data:
+                mi_liq = float(mi_data.get("liquidity_score", 0) or 0)
+                mi_vol = float(mi_data.get("volume_24h", 0) or mi_data.get("volume24h", 0) or 0)
+                if mi_liq > 0.7 and mi_vol > 10000:
+                    liquidity_boost = 0.05
+                    log.info(
+                        "Market Insights BOOST [%s]: liq_score=%.2f vol_24h=%.0f +%.3f",
+                        cid[:12], mi_liq, mi_vol, liquidity_boost,
+                    )
+
+        # Apply combined EV adjustments before orderbook + edge filter
+        total_ev_adj = ev_momentum_adj + social_boost + liquidity_boost
+        adjusted_model_prob = max(0.01, min(0.99, r["model_prob"] + total_ev_adj))
+
+        # ── CLOB orderbook ───────────────────────────────────────────────────
         try:
             ob_raw = await self.client.get_orderbook(tok_id)
         except Exception as exc:
@@ -565,9 +709,61 @@ class TradingBot:
         best_bid = ob["best_bid"]
         best_ask = ob["best_ask"]
 
-        # Edge filter
+        # ── Intelligence orderbook crosscheck (agent 572) ────────────────────
+        # Cross-validates spread and depth from Intelligence API (fail-open).
+        if self._i_cfg.get("orderbook_crosscheck_enabled", False) and self.intelligence.available and tok_id:
+            try:
+                intel_ob_list = await self.intelligence.get_orderbook_snapshot(
+                    token_id=tok_id,
+                    start_time=unix_seconds_ago(300),
+                )
+                if intel_ob_list:
+                    intel_ob = intel_ob_list[-1] if isinstance(intel_ob_list, list) else intel_ob_list
+                    # Staleness check
+                    max_age  = float(self._i_cfg.get("orderbook_crosscheck_max_age_sec", 300))
+                    snap_ts  = intel_ob.get("timestamp") or intel_ob.get("ts") or intel_ob.get("created_at")
+                    if snap_ts:
+                        try:
+                            age = time.time() - float(snap_ts)
+                            if age > max_age:
+                                log.info(
+                                    "Intel OB stale [%s]: age=%.0fs — crosscheck skipped",
+                                    cid[:12], age,
+                                )
+                                intel_ob = None
+                        except (TypeError, ValueError):
+                            pass
+                    if intel_ob is not None:
+                        ob_spread_max = float(self._i_cfg.get(
+                            "orderbook_crosscheck_max_spread",
+                            self.ob_evaluator.max_spread * 1.5,
+                        ))
+                        i_spread = intel_ob.get("spread") or intel_ob.get("spread_pct")
+                        if i_spread is not None and float(i_spread) > ob_spread_max:
+                            log.info(
+                                "Intel OB REJECT [%s]: spread=%.4f > max=%.4f",
+                                cid[:12], float(i_spread), ob_spread_max,
+                            )
+                            return
+                        i_bid  = float(intel_ob.get("bid_size", 0) or intel_ob.get("total_bid", 0) or 0)
+                        i_ask  = float(intel_ob.get("ask_size", 0) or intel_ob.get("total_ask", 0) or 0)
+                        i_depth = i_bid + i_ask
+                        min_depth = float(self._i_cfg.get(
+                            "orderbook_crosscheck_min_depth",
+                            self.ob_evaluator.min_vol * 2,
+                        ))
+                        if i_depth > 0 and i_depth < min_depth:
+                            log.info(
+                                "Intel OB REJECT [%s]: depth=%.1f < min=%.1f",
+                                cid[:12], i_depth, min_depth,
+                            )
+                            return
+            except Exception as exc:
+                log.warning("Intel OB crosscheck %s (non-fatal): %s", cid[:12], exc)
+
+        # ── Edge filter ───────────────────────────────────────────────────────
         ef_ctx = EdgeContext(
-            p_model    = r["model_prob"],
+            p_model    = adjusted_model_prob,
             p_market   = yes_px,
             best_bid   = best_bid,
             best_ask   = best_ask,
@@ -589,9 +785,9 @@ class TradingBot:
                 )
             return
 
-        # Kelly size
+        # Kelly size (uses intelligence-adjusted probability)
         size_usd = self.position_manager.kelly_size(
-            ev=r["ev"], confidence=r["confidence"],
+            ev=ef.ev, confidence=adjusted_model_prob,
             price=price, kelly_fraction=self._kelly,
         )
         if size_usd < 1.0:
@@ -602,7 +798,7 @@ class TradingBot:
 
         log.info(
             "Signal PASS [YES %s]: ev=%.4f z=%.2f conf=%.2f size=$%.2f @ %.4f",
-            question[:40], r["ev"], r["z_score"], r["confidence"], size_usd, price,
+            question[:40], ef.ev, r["z_score"], adjusted_model_prob, size_usd, price,
         )
 
         try:
@@ -612,6 +808,264 @@ class TradingBot:
             )
         except Exception as exc:
             log.error("order_manager.execute error %s: %s", cid[:12], exc)
+
+    # ── Copy trading pipeline ─────────────────────────────────────────────────
+
+    async def _copy_trading_loop(self) -> None:
+        """
+        Background pipeline: runs every N minutes.
+        H-Score leaderboard → Wallet 360 → recent trades → market quality
+        → Social Pulse confirmation → Telegram alert.
+        """
+        interval_min = int(self._i_cfg.get("copy_trading_interval_min", 15))
+        await asyncio.sleep(60)  # Brief startup delay
+
+        while not self._shutdown_flag:
+            try:
+                await self._run_copy_trading_cycle()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                log.error("copy_trading_loop error (continuing): %s", exc)
+
+            try:
+                await asyncio.sleep(interval_min * 60)
+            except asyncio.CancelledError:
+                break
+
+    async def _run_copy_trading_cycle(self) -> None:
+        """
+        Copy-trading pipeline (6 stages):
+        1. H-Score leaderboard (agent 584) — skilled traders
+        2. Wallet 360 profiling (agent 581) — filter bots/low-diversity
+        3. Polymarket Trades (agent 556) — detect recent entries
+        4. Market Insights quality check (agent 575) — liquidity/volume validation
+        5. Social Pulse confirmation (agent 585) — narrative validation
+        6. Telegram alert — no auto-execution
+        """
+        if not self.intelligence.available:
+            return
+
+        min_wr  = float(self._i_cfg.get("copy_trading_min_win_rate", 0.45))
+        max_wr  = float(self._i_cfg.get("copy_trading_max_win_rate", 0.92))
+        min_tr  = int(self._i_cfg.get("copy_trading_min_trades",    30))
+        bot_max = float(self._i_cfg.get("copy_trading_max_bot_score", 0.4))
+
+        # Stage 1: H-Score leaderboard
+        try:
+            leaders = await self.intelligence.get_hscore_leaderboard(
+                min_win_rate_15d=str(min_wr),
+                max_win_rate_15d=str(max_wr),
+                min_roi_15d="0",
+                min_total_trades_15d=str(min_tr),
+                max_total_trades_15d="5000",
+                sort_by="roi",
+                limit=20,
+            )
+        except Exception as exc:
+            log.warning("copy_trading: H-Score fetch failed: %s", exc)
+            return
+
+        if not leaders:
+            log.info("copy_trading: no qualified traders from H-Score leaderboard")
+            return
+
+        # Stage 2: Wallet 360 profiling — filter bots and low-diversity wallets
+        qualified_wallets: list[dict] = []
+        for trader in leaders[:10]:
+            wallet = (
+                trader.get("proxy_wallet")
+                or trader.get("wallet")
+                or trader.get("maker_address")
+                or trader.get("address")
+                or ""
+            )
+            roi = float(trader.get("roi_15d", 0) or trader.get("roi", 0) or 0)
+            if not wallet or roi <= 0:
+                continue
+
+            try:
+                profile_list = await self.intelligence.get_wallet_360(
+                    proxy_wallet=wallet,
+                    window_days="7",
+                )
+            except Exception as exc:
+                log.warning("copy_trading: wallet360 failed %s: %s", wallet[:10], exc)
+                continue
+
+            profile = profile_list[0] if profile_list else None
+            if not profile:
+                continue
+
+            bot_score = float(profile.get("bot_score", 0) or 0)
+            diversity  = float(
+                profile.get("market_diversity", 0)
+                or profile.get("unique_markets", 0)
+                or 0
+            )
+            if bot_score > bot_max or diversity < 2:
+                log.info(
+                    "copy_trading: skip %s bot_score=%.2f diversity=%.1f",
+                    wallet[:10], bot_score, diversity,
+                )
+                continue
+
+            qualified_wallets.append({
+                "wallet":   wallet,
+                "rank":     trader.get("rank", "?"),
+                "win_rate": float(trader.get("win_rate_15d", 0) or trader.get("win_rate", 0) or 0),
+                "roi":      roi,
+                "h_score":  float(trader.get("h_score", 0) or 0),
+            })
+
+        if not qualified_wallets:
+            log.info("copy_trading: no qualified non-bot wallets found")
+            return
+
+        # Stage 4: Market Insights quality gate — pre-fetch once per cycle
+        cycle_mi_approved: Optional[set[str]] = None
+        try:
+            mi_cycle = await self.intelligence.get_market_insights(
+                volume_trend=self._i_cfg.get("market_insights_volume_trend", "UP"),
+                min_liquidity_percentile=self._i_cfg.get(
+                    "market_insights_min_liquidity_percentile", "60"
+                ),
+                limit=200,
+            )
+            cycle_mi_approved = {
+                item.get("condition_id")
+                or item.get("conditionId")
+                or item.get("id")
+                or ""
+                for item in mi_cycle
+            }
+            log.info(
+                "copy_trading: Market Insights cycle cache: %d approved markets",
+                len(cycle_mi_approved),
+            )
+        except IntelligenceAPIError as exc:
+            log.warning("copy_trading: Market Insights pre-fetch failed (fail-open): %s", exc)
+        except Exception as exc:
+            log.warning("copy_trading: Market Insights pre-fetch error (fail-open): %s", exc)
+
+        # Stage 3+5+6: Trades → Social Pulse → alert per wallet
+        for wdata in qualified_wallets[:5]:
+            wallet = wdata["wallet"]
+            try:
+                trades = await self.intelligence.get_trades(
+                    wallet_proxy=wallet,
+                    start_time=unix_seconds_ago(48 * 3600),
+                    side="BUY",
+                    limit=20,
+                )
+            except Exception as exc:
+                log.warning("copy_trading: trades fetch failed %s: %s", wallet[:10], exc)
+                continue
+
+            for trade in trades[:5]:
+                condition_id = trade.get("condition_id") or trade.get("market_id") or ""
+                market_slug  = trade.get("market_slug") or trade.get("slug") or condition_id[:20]
+                trade_side   = (trade.get("side") or "BUY").upper()
+                trade_price  = float(trade.get("price", 0) or 0)
+
+                # Normalise timestamp (unix-seconds, unix-ms, or ISO-8601)
+                raw_ts = (
+                    trade.get("timestamp")
+                    or trade.get("created_at")
+                    or trade.get("transacted_at")
+                    or 0
+                )
+                trade_time = 0.0
+                if raw_ts:
+                    try:
+                        ts_float = float(raw_ts)
+                        trade_time = ts_float / 1000.0 if ts_float > 1e12 else ts_float
+                    except (TypeError, ValueError):
+                        try:
+                            from datetime import datetime as _dt
+                            trade_time = _dt.fromisoformat(
+                                str(raw_ts).replace("Z", "+00:00")
+                            ).timestamp()
+                        except Exception:
+                            trade_time = 0.0
+
+                if not condition_id or trade_price <= 0:
+                    continue
+                if trade_time and (time.time() - trade_time) > 14400:
+                    continue
+
+                # Market Insights quality gate
+                if cycle_mi_approved is not None and condition_id not in cycle_mi_approved:
+                    log.info(
+                        "copy_trading: market %s rejected by MI quality check",
+                        condition_id[:16],
+                    )
+                    continue
+
+                # Deduplication: skip if alerted this wallet/market in last 4h
+                dedupe_key = f"{wallet}:{condition_id}"
+                if time.time() - self._copy_trade_sent.get(dedupe_key, 0.0) < 14400:
+                    log.info(
+                        "copy_trading: skip duplicate %s wallet=%s",
+                        condition_id[:16], wallet[:10],
+                    )
+                    continue
+
+                # Stage 5: Social Pulse confirmation
+                sp_summary = ""
+                sp_flag    = ""
+                if self._i_cfg.get("social_pulse_enabled", True):
+                    try:
+                        q_text   = trade.get("question") or trade.get("market_question") or market_slug
+                        keywords = extract_keywords(q_text)
+                        if keywords:
+                            pulse = await self.intelligence.get_social_pulse(keywords)
+                            if pulse:
+                                accel    = float(pulse.get("acceleration", 1.0) or 1.0)
+                                div_pct  = float(pulse.get("author_diversity_pct", 50.0) or 50.0)
+                                sp_summary = f"accel={accel:.2f} diversity={div_pct:.0f}%"
+                                if accel > float(self._i_cfg.get("social_pulse_accel_boost", 1.5)) \
+                                        and div_pct >= float(self._i_cfg.get("social_pulse_diversity_min", 40.0)):
+                                    sp_flag = " [confirmed]"
+                                elif div_pct < 20:
+                                    sp_flag = " [low diversity — possible noise]"
+                    except Exception:
+                        pass
+
+                confidence_notes = []
+                if wdata["win_rate"] >= 0.65:
+                    confidence_notes.append("high win-rate")
+                if wdata["roi"] >= 0.5:
+                    confidence_notes.append("strong ROI")
+                confidence_str = ", ".join(confidence_notes) or "qualified trader"
+
+                alert = (
+                    f"<b>Copy-Trade Signal</b>\n"
+                    f"Market: <code>{market_slug[:40]}</code>\n"
+                    f"Side:   {trade_side} @ {trade_price:.4f}\n"
+                    f"Trader: rank={wdata['rank']} h_score={wdata['h_score']:.1f}\n"
+                    f"        win_rate={wdata['win_rate']*100:.1f}% ROI={wdata['roi']*100:.1f}%\n"
+                    f"Signal: {confidence_str}{sp_flag}\n"
+                )
+                if sp_summary:
+                    alert += f"Social: {sp_summary}\n"
+                alert += "<i>Alert only — no auto-execution</i>"
+
+                try:
+                    await self.telegram.send(alert)
+                    self._copy_trade_sent[dedupe_key] = time.time()
+                    log.info(
+                        "copy_trading: alert sent for %s wallet=%s",
+                        market_slug[:20], wallet[:10],
+                    )
+                    # Prune stale dedupe entries (older than 24h)
+                    _now = time.time()
+                    self._copy_trade_sent = {
+                        k: v for k, v in self._copy_trade_sent.items()
+                        if _now - v < 86400
+                    }
+                except Exception as exc:
+                    log.warning("copy_trading: telegram send failed: %s", exc)
 
     # ── Exit checks ───────────────────────────────────────────────────────────
 
